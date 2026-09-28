@@ -96,6 +96,24 @@ int gck_rpc_mechanism_has_sane_parameters(CK_MECHANISM_TYPE type)
 	switch (type) {
 	case CKM_RSA_PKCS_OAEP:
 	case CKM_RSA_PKCS_PSS:
+	/* Parameters below are flat (IV bytes or CK_ULONG fields, no
+	 * pointers), so a raw copy is safe.  Pointer-carrying params such
+	 * as CK_GCM_PARAMS or CK_ECDH1_DERIVE_PARAMS must NOT be added
+	 * here without real serialization. */
+	case CKM_SHA1_RSA_PKCS_PSS:
+	case CKM_SHA224_RSA_PKCS_PSS:
+	case CKM_SHA256_RSA_PKCS_PSS:
+	case CKM_SHA384_RSA_PKCS_PSS:
+	case CKM_SHA512_RSA_PKCS_PSS:
+	case CKM_AES_CBC:
+	case CKM_AES_CBC_PAD:
+	case CKM_AES_CTR:
+	case CKM_AES_KEY_WRAP:
+	case CKM_AES_KEY_WRAP_PAD:
+	case CKM_DES_CBC:
+	case CKM_DES_CBC_PAD:
+	case CKM_DES3_CBC:
+	case CKM_DES3_CBC_PAD:
 		return 1;
 	default:
 		return 0;
@@ -196,6 +214,20 @@ int gck_rpc_mechanism_has_no_parameters(CK_MECHANISM_TYPE mech)
 	case CKM_RIPEMD160:
 	case CKM_RIPEMD160_HMAC:
 	case CKM_KEY_WRAP_LYNKS:
+	case CKM_AES_CMAC:
+	case CKM_SHA224:
+	case CKM_SHA224_HMAC:
+	case CKM_SHA224_RSA_PKCS:
+	case CKM_SHA3_224:
+	case CKM_SHA3_224_HMAC:
+	case CKM_SHA3_256:
+	case CKM_SHA3_256_HMAC:
+	case CKM_SHA3_384:
+	case CKM_SHA3_384_HMAC:
+	case CKM_SHA3_512:
+	case CKM_SHA3_512_HMAC:
+	case CKM_EC_EDWARDS_KEY_PAIR_GEN:
+	case CKM_EC_MONTGOMERY_KEY_PAIR_GEN:
 		return 1;
 	default:
 		return 0;
