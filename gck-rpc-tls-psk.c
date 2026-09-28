@@ -235,8 +235,36 @@ _tls_psk_client_cb(SSL *ssl, const char *hint,
 		   char *identity, unsigned int max_identity_len,
 		   unsigned char *psk, unsigned int max_psk_len)
 {
-	/* Client tells server which identity it wants to use in ClientKeyExchange */
-	snprintf(identity, max_identity_len, "%s", tls_psk_identity);
+	/* Client tells server which identity it wants to use in ClientKeyExchange.
+	 * Without a configured identity, use the first one in our keyfile;
+	 * sending an empty identity would make the server pick the first
+	 * entry of *its* keyfile, which is a different key in multi-client
+	 * setups. */
+	if (tls_psk_identity[0]) {
+		snprintf(identity, max_identity_len, "%s", tls_psk_identity);
+	} else {
+		char line[1024], *colon;
+		int fd;
+
+		identity[0] = '\0';
+		fd = open(tls_psk_key_filename, O_RDONLY | O_CLOEXEC);
+		if (fd >= 0) {
+			/* Same line format rules as _tls_psk_server_cb() */
+			while (_fgets(line, sizeof(line) - 1, fd) > 0) {
+				if ((colon = strchr(line, ':')) == NULL)
+					continue;
+				*colon = '\0';
+				snprintf(identity, max_identity_len, "%s", line);
+				break;
+			}
+			close(fd);
+		}
+		if (! identity[0]) {
+			warning(("can't determine TLS-PSK identity from keyfile '%.100s'",
+				 tls_psk_key_filename));
+			return 0;
+		}
+	}
 
 	/* We currently just discard the hint sent to us by the server */
 	return _tls_psk_server_cb(ssl, identity, psk, max_psk_len);
