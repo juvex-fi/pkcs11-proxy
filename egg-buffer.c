@@ -24,6 +24,7 @@
 
 #include <string.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 #include "egg-buffer.h"
 
@@ -155,9 +156,12 @@ int egg_buffer_reserve(EggBuffer * buffer, size_t len)
 		return 1;
 
 	/* Calculate a new length, minimize number of buffer allocations */
-	newlen = buffer->allocated_len * 2;
+	if (buffer->allocated_len > SIZE_MAX / 2)
+		newlen = len;
+	else
+		newlen = buffer->allocated_len * 2;
 	if (len > newlen)
-		newlen += len;
+		newlen = (newlen > SIZE_MAX - len) ? len : newlen + len;
 
 	/* Memory owned elsewhere can't be reallocated */
 	if (!buffer->allocator) {
@@ -190,6 +194,10 @@ int egg_buffer_resize(EggBuffer * buffer, size_t len)
 unsigned char *egg_buffer_add_empty(EggBuffer * buffer, size_t len)
 {
 	size_t pos = buffer->len;
+	if (len > SIZE_MAX - buffer->len) {
+		buffer->failures++;
+		return NULL;
+	}
 	if (!egg_buffer_reserve(buffer, buffer->len + len))
 		return NULL;
 	buffer->len += len;
@@ -198,6 +206,10 @@ unsigned char *egg_buffer_add_empty(EggBuffer * buffer, size_t len)
 
 int egg_buffer_append(EggBuffer * buffer, const unsigned char *val, size_t len)
 {
+	if (len > SIZE_MAX - buffer->len) {
+		buffer->failures++;
+		return 0;
+	}
 	if (!egg_buffer_reserve(buffer, buffer->len + len))
 		return 0;	/* failures already incremented */
 	memcpy(buffer->buf + buffer->len, val, len);

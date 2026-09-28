@@ -186,7 +186,7 @@ static CK_C_INITIALIZE_ARGS p11_init_args = {
 };
 #endif
 
-static int is_running = 1;
+static volatile sig_atomic_t is_running = 1;
 
 static int usage(void)
 {
