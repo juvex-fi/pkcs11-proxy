@@ -11,8 +11,8 @@
 
 # define PKCS11PROXY_TLS_PSK_CIPHERS "PSK-AES128-CBC-SHA:PSK-AES256-CBC-SHA";
 
-//# define DEBUG_SECCOMP
-//# define SECCOMP
+/* SECCOMP and DEBUG_SECCOMP are set by CMake (PKCS11_SECCOMP,
+ * PKCS11_SECCOMP_DEBUG); seccomp is on by default for Linux builds. */
 
 #ifdef __MINGW32__
 

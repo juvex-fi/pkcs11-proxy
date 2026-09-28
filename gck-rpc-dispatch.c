@@ -55,7 +55,6 @@
 
 #ifdef SECCOMP
 #include <seccomp.h>
-//#include "seccomp-bpf.h"
 #ifdef DEBUG_SECCOMP
 # include "syscall-reporter.h"
 #endif /* DEBUG_SECCOMP */
@@ -112,6 +111,7 @@ static pthread_mutex_t pkcs11_dispatchers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CK_RV rpc_C_Finalize(CallState *);
 
 static int _install_dispatch_syscall_filter(int use_tls);
+static int use_seccomp = 1;
 
 /* -----------------------------------------------------------------------------
  * LOGGING and DEBUGGING
@@ -2843,7 +2843,7 @@ static void *run_dispatch_thread(void *arg)
 	CallState *cs = arg;
 	assert(cs->sock != -1);
 
-	if (_install_dispatch_syscall_filter((cs->tls != NULL)))
+	if (use_seccomp && _install_dispatch_syscall_filter((cs->tls != NULL)))
 		return NULL;
 
 	run_dispatch_loop(cs);
@@ -3225,6 +3225,11 @@ void gck_rpc_layer_uninitialize(void)
 	pkcs11_module32 = NULL;
 }
 
+void gck_rpc_layer_set_seccomp(int enabled)
+{
+	use_seccomp = enabled;
+}
+
 void gck_rpc_layer_set_module_v32(CK_FUNCTION_LIST_3_2_PTR funcs32)
 {
 	pkcs11_module32 = funcs32;
@@ -3251,55 +3256,72 @@ static int _install_dispatch_syscall_filter(int use_tls)
 	 * These are the basic syscalls needed to be able to use
 	 * the syscall-reporter to figure out the rest
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
-#ifdef DEBUG_SECCOMP
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(rt_sigreturn), 0);
-# ifdef __NR_sigreturn
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(sigreturn), 0);
-# endif
-#endif /* DEBUG_SECCOMP */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+#define ALLOW(name) seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(name), 0)
+	ALLOW(write);
+	/* Also needed when SIGTERM is delivered to this thread */
+	ALLOW(rt_sigreturn);
+	ALLOW(sigreturn);
+	ALLOW(exit);
+	ALLOW(exit_group);
 
 	/*
 	 * Network related syscalls.
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(sendto), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(recvfrom), 0);
+	ALLOW(read);
+	ALLOW(sendto);
+	ALLOW(recvfrom);
+	/* OpenSSL probes for kernel TLS (TCP_ULP) */
+	ALLOW(setsockopt);
+	/* syslog() connects to /dev/log */
+	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+			 SCMP_A0(SCMP_CMP_EQ, AF_UNIX));
+	ALLOW(connect);
 
 	/*
-	 * TLS-PSK
+	 * Memory management and threads. brk is needed in inetd mode, where
+	 * the dispatcher runs on the main thread (main malloc arena).
 	 */
-	if (use_tls)
-		/* Allow open() of the TLS-PSK keyfile. */
-		seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(open), 1,
-				 SCMP_A1(SCMP_CMP_EQ, O_RDONLY | O_CLOEXEC));
-
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
-
-	/*
-	 * pthreads?
-	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(madvise), 0);
+	ALLOW(brk);
+	ALLOW(mmap);
+	ALLOW(munmap);
+	ALLOW(madvise);
 	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 1,
 			 SCMP_A2(SCMP_CMP_EQ, PROT_READ|PROT_WRITE));
+	ALLOW(futex);
+	ALLOW(rseq);
+	ALLOW(getpid);
+	ALLOW(gettid);
+	ALLOW(rt_sigprocmask);
+	ALLOW(getrandom);
+	ALLOW(clock_gettime);
 
 	/*
-	 * SoftHSM 1.3.0
+	 * File I/O: TLS-PSK keyfile and the PKCS#11 module (SoftHSM creates
+	 * and rewrites token files, so open() can't be limited to O_RDONLY).
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(getcwd), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(stat), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(open), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(lseek), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(access), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(fsync), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(unlink), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(ftruncate), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(select), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(futex), 0);
+	ALLOW(open);
+	ALLOW(openat);
+	ALLOW(close);
+	ALLOW(getcwd);
+	ALLOW(stat);
+	ALLOW(newfstatat);
+	ALLOW(fstat);
+	ALLOW(fcntl);
+	ALLOW(lseek);
+	ALLOW(pread64);
+	ALLOW(pwrite64);
+	ALLOW(access);
+	ALLOW(faccessat);
+	ALLOW(fsync);
+	ALLOW(fdatasync);
+	ALLOW(ftruncate);
+	ALLOW(getdents64);
+	ALLOW(unlink);
+	ALLOW(unlinkat);
+	ALLOW(select);
+	ALLOW(pselect6);
+	ALLOW(poll);
+#undef ALLOW
 
 	rc = seccomp_load(ctx);
 	if (rc < 0)

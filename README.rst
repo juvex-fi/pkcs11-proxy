@@ -5,7 +5,8 @@ PKCS11 Proxy
 This fork has the following additional features:
 
 - support for running in "inetd mode", useful for calling directly from stunnel
-- seccomp syscall filtering (only tested in inetd-mode)
+- seccomp syscall filtering, on by default for Linux builds (see USAGE)
+- privilege dropping with ``--drop-privs <user>``
 - getaddrinfo support for IPv6, fallback and DNS resolution
 - TLS-PSK support to optionally encrypt communication
 

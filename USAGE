@@ -80,3 +80,33 @@ slots: Slot 0           SoftHSM
   token label:   test token manuf:   SoftHSM token model:   SoftHSM
   token flags:   rng, login required, PIN initialized, token initialized,
   other flags=0x40 serial num  :  1
+
+
+Daemon options
+==============
+
+pkcs11-daemon pkcs11-module [<socket>|"-"] [--drop-privs <user>] [--no-seccomp]
+
+The socket may also be given in PKCS11_DAEMON_SOCKET; "-" selects inetd mode.
+
+--drop-privs <user>
+    When started as root, switch to <user> (and its groups) once the module
+    is initialized and the socket is bound. Everything the module touches
+    later, e.g. SoftHSM's token directory, must be accessible to <user>.
+
+--no-seccomp
+    Don't install the seccomp syscall filters. Useful when a PKCS#11 module
+    needs syscalls that aren't whitelisted, or when seccomp is unavailable
+    (e.g. under user-mode CPU emulation).
+
+Seccomp
+=======
+
+On Linux, pkcs11-daemon confines itself with libseccomp filters by default:
+one for the process after start-up, and a stricter one for each client
+thread. Disallowed syscalls kill the daemon. Build options:
+
+  -DPKCS11_SECCOMP=OFF        build without seccomp (and without libseccomp)
+  -DPKCS11_SECCOMP_DEBUG=ON   report the name of a disallowed syscall on
+                              stderr instead of killing silently; for
+                              extending the whitelist, not for production

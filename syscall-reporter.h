@@ -12,18 +12,23 @@
 #ifndef _BPF_REPORTER_H_
 #define _BPF_REPORTER_H_
 
-#include "seccomp-bpf.h"
+#ifndef _GNU_SOURCE
+# define _GNU_SOURCE 1
+#endif
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#ifndef SYS_SECCOMP
+# define SYS_SECCOMP 1
+#endif
 
-/* Since this redfines "KILL_PROCESS" into a TRAP for the reporter hook,
- * we want to make sure it stands out in the build as it should not be
- * used in the final program.
+/* The reporter goes with filters that TRAP instead of KILL, so make sure
+ * it stands out in the build as it should not be used in the final program.
  */
 #ifdef DEBUG_SECCOMP
 #warning "You've included the syscall reporter. Do not use in production!"
 #endif
-#undef KILL_PROCESS
-#define KILL_PROCESS \
-		BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_TRAP)
 
 extern int install_syscall_reporter(void);
 

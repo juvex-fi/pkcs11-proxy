@@ -37,20 +37,20 @@ static void write_uint(char *buf, unsigned int val)
 static void reporter(int nr, siginfo_t *info, void *void_context)
 {
 	char buf[128];
-	ucontext_t *ctx = (ucontext_t *)(void_context);
 	unsigned int syscall;
+	const unsigned int n_names = sizeof(syscall_names) / sizeof(syscall_names[0]);
+
 	if (info->si_code != SYS_SECCOMP)
 		return;
-	if (!ctx)
-		return;
-	syscall = ctx->uc_mcontext.gregs[REG_SYSCALL];
+	/* Portable across architectures, unlike reading ucontext registers */
+	syscall = info->si_syscall;
 	strcpy(buf, msg_needed);
-	if (syscall < sizeof(syscall_names)) {
+	if (syscall < n_names && syscall_names[syscall]) {
 		strcat(buf, syscall_names[syscall]);
 		strcat(buf, "(");
 	}
 	write_uint(buf + strlen(buf), syscall);
-	if (syscall < sizeof(syscall_names))
+	if (syscall < n_names && syscall_names[syscall])
 		strcat(buf, ")");
 	strcat(buf, "\n");
 	write(STDERR_FILENO, buf, strlen(buf));

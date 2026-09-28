@@ -15,6 +15,9 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR funcs);
 /* Optionally set the v3.2 function list for v3.0/v3.2 function dispatch */
 void gck_rpc_layer_set_module_v32(CK_FUNCTION_LIST_3_2_PTR funcs32);
 
+/* Whether dispatch threads install their seccomp filter (default: yes) */
+void gck_rpc_layer_set_seccomp(int enabled);
+
 /* Should be called to cleanup dispatcher */
 void gck_rpc_layer_uninitialize(void);
 

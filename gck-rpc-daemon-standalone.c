@@ -34,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <pwd.h>
+#include <grp.h>
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -48,11 +50,11 @@
 
 #ifdef SECCOMP
 #include <seccomp.h>
-//#include "seccomp-bpf.h"
 #ifdef DEBUG_SECCOMP
 # include "syscall-reporter.h"
 #endif /* DEBUG_SECCOMP */
 #include <fcntl.h> /* for seccomp init */
+#include <sys/socket.h>
 #endif /* SECCOMP */
 
 
@@ -70,83 +72,98 @@ static int install_syscall_filter(const int sock, const char *tls_psk_keyfile, c
 	if (ctx == NULL)
 		goto failure_scmp;
 	/*
-	 * These are the basic syscalls needed to be able to use
-	 * the syscall-reporter to figure out the rest
+	 * SCMP_SYS() of a syscall that doesn't exist on this architecture
+	 * (e.g. open/stat/select on aarch64) makes seccomp_rule_add() fail
+	 * harmlessly, so no per-arch #ifdefs are needed.
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
-#ifdef DEBUG_SECCOMP
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(rt_sigreturn), 0);
-# ifdef __NR_sigreturn
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(sigreturn), 0);
-# endif
-#endif /* DEBUG_SECCOMP */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+#define ALLOW(name) seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(name), 0)
+
+	/* Basics, also needed by the syscall-reporter and the SIGTERM handler */
+	ALLOW(write);
+	ALLOW(rt_sigreturn);
+	ALLOW(sigreturn);
+	ALLOW(exit);
+	ALLOW(exit_group);
 
 	/*
 	 * Network related syscalls.
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(select), 0);
-	if (sock)
+	ALLOW(read);
+	ALLOW(select);
+	ALLOW(pselect6);
+	ALLOW(poll);
+	if (sock) {
 		/* Allow accept() only for the listening socket */
 		seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(accept), 1,
 				 SCMP_A0(SCMP_CMP_EQ, sock));
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(sendto), 0);
-	if (path[0] &&
-	    strncmp(path, "tcp://", strlen("tcp://")) == 0) {
-		/* TCP socket - not needed for TLS */
-		seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(recvfrom), 0);
+		seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(accept4), 1,
+				 SCMP_A0(SCMP_CMP_EQ, sock));
 	}
+	ALLOW(sendto);
+	ALLOW(recvfrom);
+	/* OpenSSL probes for kernel TLS (TCP_ULP) */
+	ALLOW(setsockopt);
+	/* syslog() connects to /dev/log */
+	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+			 SCMP_A0(SCMP_CMP_EQ, AF_UNIX));
+	ALLOW(connect);
 
 	/*
-	 * These are probably pthreads-related.
+	 * Memory management, threads, signals (glibc, OpenSSL 3.x).
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(clone), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(set_robust_list), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(madvise), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(munlock), 0);
-
-	/*
-	 * Both pthreads (? file is "/sys/devices/system/cpu/online") and TLS-PSK open files.
-	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(open), 1,
-			 SCMP_A1(SCMP_CMP_EQ, O_RDONLY | O_CLOEXEC));
-
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
-
-	/*
-	 * UNIX domain socket
-	 */
-	if (path[0] &&
-	    strncmp(path, "tcp://", strlen("tcp://")) != 0 &&
-	    strncmp(path, "tls://", strlen("tls://")) != 0) {
-		seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(unlink), 0);
-	}
+	ALLOW(brk);
+	ALLOW(mmap);
+	ALLOW(munmap);
+	ALLOW(mprotect);
+	ALLOW(madvise);
+	ALLOW(munlock);
+	ALLOW(clone);
+	ALLOW(clone3);
+	ALLOW(set_robust_list);
+	ALLOW(rseq);
+	ALLOW(membarrier);
+	ALLOW(futex);
+	ALLOW(getpid);
+	ALLOW(gettid);
+	ALLOW(rt_sigaction);
+	ALLOW(rt_sigprocmask);
+	ALLOW(sigaltstack);
+	ALLOW(getrandom);
+	ALLOW(clock_gettime);
+	ALLOW(sysinfo);
+	ALLOW(ioctl);
 
 	/*
 	 * Allow spawned threads to initialize a new seccomp policy (subset of this).
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(prctl), 0);
+	ALLOW(prctl);
+	ALLOW(seccomp);
 
 	/*
-	 * SoftHSM 1.3.0 required syscalls
+	 * File I/O: TLS-PSK keyfile, the Unix socket and the PKCS#11 module.
+	 * open()/openat() can't be limited to O_RDONLY since e.g. SoftHSM
+	 * creates and rewrites its token files.
 	 */
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(getcwd), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(stat), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(open), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(lseek), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(access), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(fsync), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(unlink), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(ftruncate), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(select), 0);
-	seccomp_rule_add(ctx,SCMP_ACT_ALLOW, SCMP_SYS(futex), 0);
+	ALLOW(open);
+	ALLOW(openat);
+	ALLOW(close);
+	ALLOW(getcwd);
+	ALLOW(stat);
+	ALLOW(newfstatat);
+	ALLOW(fstat);
+	ALLOW(fcntl);
+	ALLOW(lseek);
+	ALLOW(pread64);
+	ALLOW(pwrite64);
+	ALLOW(access);
+	ALLOW(faccessat);
+	ALLOW(fsync);
+	ALLOW(fdatasync);
+	ALLOW(ftruncate);
+	ALLOW(getdents64);
+	ALLOW(unlink);
+	ALLOW(unlinkat);
+#undef ALLOW
 
 #ifdef DEBUG_SECCOMP
 	/* Dumps the generated BPF rules in sort-of human readable syntax. */
@@ -166,7 +183,8 @@ static int install_syscall_filter(const int sock, const char *tls_psk_keyfile, c
 
 failure_scmp:
 	errno = -rc;
-	fprintf(stderr, "Seccomp filter initialization failed, errno = %u\n", errno);
+	fprintf(stderr, "Seccomp filter initialization failed: %s (errno %u); "
+		"use --no-seccomp if seccomp is unavailable\n", strerror(errno), errno);
 	return errno;
 #else /* SECCOMP */
         return 0;
@@ -190,13 +208,54 @@ static volatile sig_atomic_t is_running = 1;
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: pkcs11-daemon pkcs11-module [<socket>|\"-\"]\n\tUsing \"-\" results in a single-thread inetd-type daemon\n");
+	fprintf(stderr, "usage: pkcs11-daemon pkcs11-module [<socket>|\"-\"] [--drop-privs <user>] [--no-seccomp]\n"
+		"\tUsing \"-\" results in a single-thread inetd-type daemon\n"
+		"\t--drop-privs <user>  switch to <user> after the socket is bound (when started as root)\n"
+		"\t--no-seccomp         don't install the seccomp syscall filters\n");
 	exit(2);
 }
 
 void termination_handler (int signum)
 {
 	is_running = 0;
+}
+
+/*
+ * Switch to an unprivileged user. Called after the module is initialized
+ * and the socket is bound, so those may still need root.
+ */
+static int drop_privileges(const char *username)
+{
+	struct passwd *pw;
+
+	if (getuid() != 0 && geteuid() != 0) {
+		fprintf(stderr, "not running as root, ignoring --drop-privs %s\n",
+			username);
+		return 0;
+	}
+
+	pw = getpwnam(username);
+	if (!pw) {
+		fprintf(stderr, "couldn't find user '%s'\n", username);
+		return -1;
+	}
+
+	/* Group first: setgid() is no longer permitted once uid is dropped */
+	if (initgroups(pw->pw_name, pw->pw_gid) < 0 ||
+	    setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
+		fprintf(stderr, "couldn't switch to user '%s': %s\n", username,
+			strerror(errno));
+		return -1;
+	}
+
+	if (pw->pw_uid != 0 && (setuid(0) == 0 || seteuid(0) == 0)) {
+		fprintf(stderr, "was able to regain root after dropping privileges\n");
+		return -1;
+	}
+
+	syslog(LOG_INFO, "dropped privileges to user '%s' (uid=%u, gid=%u)",
+	       username, (unsigned)pw->pw_uid, (unsigned)pw->pw_gid);
+	return 0;
 }
 
 enum {
@@ -211,15 +270,31 @@ int main(int argc, char *argv[])
 	CK_FUNCTION_LIST_PTR funcs;
 	void *module;
 	const char *path, *tls_psk_keyfile;
+	const char *socket_arg = NULL, *drop_privs_user = NULL;
+	int use_seccomp = 1;
 	fd_set read_fds;
-	int sock, ret, mode;
+	int sock, ret, mode, i;
 	CK_RV rv;
 	CK_C_INITIALIZE_ARGS init_args;
 	GckRpcTlsPskState *tls;
 
-	/* The module to load is the argument */
-	if (argc != 2 && argc != 3)
+	/* The module to load is the first argument, then an optional socket
+	 * and options in any order */
+	if (argc < 2 || argv[1][0] == '-')
 		usage();
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--drop-privs") == 0) {
+			if (++i >= argc || !argv[i][0])
+				usage();
+			drop_privs_user = argv[i];
+		} else if (strcmp(argv[i], "--no-seccomp") == 0) {
+			use_seccomp = 0;
+		} else if (strncmp(argv[i], "--", 2) == 0 || socket_arg) {
+			usage();
+		} else {
+			socket_arg = argv[i];
+		}
+	}
 
         openlog("pkcs11-proxy",LOG_CONS|LOG_PID,LOG_DAEMON);
 
@@ -278,8 +353,8 @@ int main(int argc, char *argv[])
 	}
 
 	path = getenv("PKCS11_DAEMON_SOCKET");
-	if (!path && argc == 3)
-           path = argv[2];
+	if (!path)
+           path = socket_arg;
         if (!path)
 	   path = SOCKET_PATH;
 
@@ -322,13 +397,21 @@ int main(int argc, char *argv[])
 		mode = GCP_RPC_DAEMON_MODE_SOCKET;
 	}
 
+	if (drop_privs_user && drop_privileges(drop_privs_user) < 0)
+		exit(1);
+
 	/*
 	 * Enable seccomp. This is essentially a whitelist containing all the syscalls
 	 * we expect to call from here on. Anything not whitelisted will cause the
 	 * process to terminate.
 	 */
-        if (install_syscall_filter(sock, tls_psk_keyfile, path))
-        	return 1;
+	gck_rpc_layer_set_seccomp(use_seccomp);
+	if (use_seccomp) {
+		if (install_syscall_filter(sock, tls_psk_keyfile, path))
+			return 1;
+	} else {
+		syslog(LOG_WARNING, "seccomp disabled by --no-seccomp");
+	}
 
         if (mode == GCP_RPC_DAEMON_MODE_INETD) {
            gck_rpc_layer_inetd(funcs);
