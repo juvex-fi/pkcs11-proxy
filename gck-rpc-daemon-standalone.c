@@ -262,6 +262,21 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
+	/* Optionally get the v3.2 function list for extended API support */
+	{
+		CK_C_GetInterface func_get_iface =
+		    (CK_C_GetInterface) dlsym(module, "C_GetInterface");
+		if (func_get_iface) {
+			CK_INTERFACE_PTR iface = NULL;
+			CK_VERSION ver32 = {3, 2};
+			if (func_get_iface((CK_UTF8CHAR_PTR)"PKCS 11", &ver32,
+					   &iface, 0) == CKR_OK && iface &&
+			    iface->pFunctionList)
+				gck_rpc_layer_set_module_v32(
+				    (CK_FUNCTION_LIST_3_2_PTR)iface->pFunctionList);
+		}
+	}
+
 	path = getenv("PKCS11_DAEMON_SOCKET");
 	if (!path && argc == 3)
            path = argv[2];

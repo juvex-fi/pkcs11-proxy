@@ -11,3 +11,14 @@ Makefile
 Trolltech.conf
 obj-i686-linux-gnu
 syscall-names.h
+
+# CMake in-tree build outputs
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+*.dylib
+*.so
+*.so.*
+/pkcs11-daemon
+resume.txt

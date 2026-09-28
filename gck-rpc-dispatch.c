@@ -65,6 +65,7 @@
 
 /* Where we dispatch the calls to */
 static CK_FUNCTION_LIST_PTR pkcs11_module = NULL;
+static CK_FUNCTION_LIST_3_2_PTR pkcs11_module32 = NULL;
 
 /* The error returned on protocol failures */
 #define PARSE_ERROR CKR_DEVICE_ERROR
@@ -82,8 +83,8 @@ typedef struct _CallState {
 	uint64_t appid;
 	int call;
 	int sock;
-        int (*read)(void *cs, unsigned char *,size_t);
-        int (*write)(void *cs, unsigned char *,size_t);
+        int (*read)(struct _CallState *cs, void *, size_t);
+        int (*write)(struct _CallState *cs, void *, size_t);
 	struct sockaddr_storage addr;
 	socklen_t addrlen;
 	/* XXX Maybe sessions should be a linked list instead, to remove the hard
@@ -771,6 +772,14 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
 		CK_ ## call_id _func = pkcs11_module-> call_id; \
 		CK_RV _ret = CKR_OK; \
 		if (!_func) { _ret = CKR_GENERAL_ERROR; goto _cleanup; }
+
+#define BEGIN_CALL_32(call_id) \
+	debug ((#call_id ": enter")); \
+	assert (cs); \
+	{  \
+		CK_ ## call_id _func = pkcs11_module32 ? pkcs11_module32-> call_id : NULL; \
+		CK_RV _ret = CKR_OK; \
+		if (!_func) { _ret = CKR_FUNCTION_NOT_SUPPORTED; goto _cleanup; }
 
 #define PROCESS_CALL(args)\
 	assert (gck_rpc_message_is_verified (cs->req)); \
@@ -2003,6 +2012,495 @@ static CK_RV rpc_C_GenerateRandom(CallState * cs)
 }
 
 /* ---------------------------------------------------------------------------
+ * PKCS#11 v3.0/v3.2 HANDLERS
+ */
+
+static CK_RV rpc_C_LoginUser(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_USER_TYPE user_type;
+	CK_BYTE_PTR pin; CK_ULONG pin_len;
+	CK_BYTE_PTR username; CK_ULONG username_len;
+	BEGIN_CALL_32(C_LoginUser);
+	IN_ULONG(session);
+	IN_ULONG(user_type);
+	IN_BYTE_ARRAY(pin, pin_len);
+	IN_BYTE_ARRAY(username, username_len);
+	PROCESS_CALL((session, user_type, pin, pin_len, username, username_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_SessionCancel(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_FLAGS flags;
+	BEGIN_CALL_32(C_SessionCancel);
+	IN_ULONG(session);
+	IN_ULONG(flags);
+	PROCESS_CALL((session, flags));
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageEncryptInit(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE key;
+	BEGIN_CALL_32(C_MessageEncryptInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL((session, &mechanism, key));
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncryptMessage(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
+	CK_BYTE_PTR plaintext; CK_ULONG plaintext_len;
+	CK_BYTE_PTR ciphertext;
+	DECLARE_CK_ULONG_PTR(ciphertext_len);
+	BEGIN_CALL_32(C_EncryptMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	IN_BYTE_ARRAY(plaintext, plaintext_len);
+	IN_BYTE_BUFFER(ciphertext, ciphertext_len);
+	PROCESS_CALL((session, parameter, parameter_len, associated_data, associated_data_len, plaintext, plaintext_len, ciphertext, ciphertext_len));
+	OUT_BYTE_ARRAY(ciphertext, ciphertext_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncryptMessageBegin(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
+	BEGIN_CALL_32(C_EncryptMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	PROCESS_CALL((session, parameter, parameter_len, associated_data, associated_data_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncryptMessageNext(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR plaintext_part; CK_ULONG plaintext_part_len;
+	CK_BYTE_PTR ciphertext_part;
+	DECLARE_CK_ULONG_PTR(ciphertext_part_len);
+	CK_FLAGS flags;
+	BEGIN_CALL_32(C_EncryptMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(plaintext_part, plaintext_part_len);
+	IN_BYTE_BUFFER(ciphertext_part, ciphertext_part_len);
+	IN_ULONG(flags);
+	PROCESS_CALL((session, parameter, parameter_len, plaintext_part, plaintext_part_len, ciphertext_part, ciphertext_part_len, flags));
+	OUT_BYTE_ARRAY(ciphertext_part, ciphertext_part_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageEncryptFinal(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	BEGIN_CALL_32(C_MessageEncryptFinal);
+	IN_ULONG(session);
+	PROCESS_CALL((session));
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageDecryptInit(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE key;
+	BEGIN_CALL_32(C_MessageDecryptInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL((session, &mechanism, key));
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecryptMessage(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
+	CK_BYTE_PTR ciphertext; CK_ULONG ciphertext_len;
+	CK_BYTE_PTR plaintext;
+	DECLARE_CK_ULONG_PTR(plaintext_len);
+	BEGIN_CALL_32(C_DecryptMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	IN_BYTE_ARRAY(ciphertext, ciphertext_len);
+	IN_BYTE_BUFFER(plaintext, plaintext_len);
+	PROCESS_CALL((session, parameter, parameter_len, associated_data, associated_data_len, ciphertext, ciphertext_len, plaintext, plaintext_len));
+	OUT_BYTE_ARRAY(plaintext, plaintext_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecryptMessageBegin(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
+	BEGIN_CALL_32(C_DecryptMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	PROCESS_CALL((session, parameter, parameter_len, associated_data, associated_data_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecryptMessageNext(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR ciphertext_part; CK_ULONG ciphertext_part_len;
+	CK_BYTE_PTR plaintext_part;
+	DECLARE_CK_ULONG_PTR(plaintext_part_len);
+	CK_FLAGS flags;
+	BEGIN_CALL_32(C_DecryptMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(ciphertext_part, ciphertext_part_len);
+	IN_BYTE_BUFFER(plaintext_part, plaintext_part_len);
+	IN_ULONG(flags);
+	PROCESS_CALL((session, parameter, parameter_len, ciphertext_part, ciphertext_part_len, plaintext_part, plaintext_part_len, flags));
+	OUT_BYTE_ARRAY(plaintext_part, plaintext_part_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageDecryptFinal(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	BEGIN_CALL_32(C_MessageDecryptFinal);
+	IN_ULONG(session);
+	PROCESS_CALL((session));
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageSignInit(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE key;
+	BEGIN_CALL_32(C_MessageSignInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL((session, &mechanism, key));
+	END_CALL;
+}
+
+static CK_RV rpc_C_SignMessage(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR data; CK_ULONG data_len;
+	CK_BYTE_PTR signature;
+	DECLARE_CK_ULONG_PTR(signature_len);
+	BEGIN_CALL_32(C_SignMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_BUFFER(signature, signature_len);
+	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
+	OUT_BYTE_ARRAY(signature, signature_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_SignMessageBegin(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	BEGIN_CALL_32(C_SignMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	PROCESS_CALL((session, parameter, parameter_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_SignMessageNext(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR data; CK_ULONG data_len;
+	CK_BYTE_PTR signature;
+	DECLARE_CK_ULONG_PTR(signature_len);
+	BEGIN_CALL_32(C_SignMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_BUFFER(signature, signature_len);
+	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
+	OUT_BYTE_ARRAY(signature, signature_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageSignFinal(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	BEGIN_CALL_32(C_MessageSignFinal);
+	IN_ULONG(session);
+	PROCESS_CALL((session));
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageVerifyInit(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE key;
+	BEGIN_CALL_32(C_MessageVerifyInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL((session, &mechanism, key));
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifyMessage(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR data; CK_ULONG data_len;
+	CK_BYTE_PTR signature; CK_ULONG signature_len;
+	BEGIN_CALL_32(C_VerifyMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_ARRAY(signature, signature_len);
+	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifyMessageBegin(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	BEGIN_CALL_32(C_VerifyMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	PROCESS_CALL((session, parameter, parameter_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifyMessageNext(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	CK_BYTE_PTR data; CK_ULONG data_len;
+	CK_BYTE_PTR signature; CK_ULONG signature_len;
+	BEGIN_CALL_32(C_VerifyMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_ARRAY(signature, signature_len);
+	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageVerifyFinal(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	BEGIN_CALL_32(C_MessageVerifyFinal);
+	IN_ULONG(session);
+	PROCESS_CALL((session));
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncapsulateKey(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE public_key;
+	CK_ATTRIBUTE_PTR template; CK_ULONG template_count;
+	CK_BYTE_PTR ciphertext;
+	DECLARE_CK_ULONG_PTR(ciphertext_len);
+	CK_OBJECT_HANDLE key;
+	BEGIN_CALL_32(C_EncapsulateKey);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(public_key);
+	IN_ATTRIBUTE_ARRAY(template, template_count);
+	IN_BYTE_BUFFER(ciphertext, ciphertext_len);
+	PROCESS_CALL((session, &mechanism, public_key, template, template_count, ciphertext, ciphertext_len, &key));
+	OUT_BYTE_ARRAY(ciphertext, ciphertext_len);
+	OUT_ULONG(key);
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecapsulateKey(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE private_key;
+	CK_ATTRIBUTE_PTR template; CK_ULONG template_count;
+	CK_BYTE_PTR ciphertext; CK_ULONG ciphertext_len;
+	CK_OBJECT_HANDLE key;
+	BEGIN_CALL_32(C_DecapsulateKey);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(private_key);
+	IN_ATTRIBUTE_ARRAY(template, template_count);
+	IN_BYTE_ARRAY(ciphertext, ciphertext_len);
+	PROCESS_CALL((session, &mechanism, private_key, template, template_count, ciphertext, ciphertext_len, &key));
+	OUT_ULONG(key);
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignatureInit(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE key;
+	CK_BYTE_PTR signature; CK_ULONG signature_len;
+	BEGIN_CALL_32(C_VerifySignatureInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	IN_BYTE_ARRAY(signature, signature_len);
+	PROCESS_CALL((session, &mechanism, key, signature, signature_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignature(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR data; CK_ULONG data_len;
+	BEGIN_CALL_32(C_VerifySignature);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(data, data_len);
+	PROCESS_CALL((session, data, data_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignatureUpdate(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR part; CK_ULONG part_len;
+	BEGIN_CALL_32(C_VerifySignatureUpdate);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(part, part_len);
+	PROCESS_CALL((session, part, part_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignatureFinal(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	BEGIN_CALL_32(C_VerifySignatureFinal);
+	IN_ULONG(session);
+	PROCESS_CALL((session));
+	END_CALL;
+}
+
+static CK_RV rpc_C_GetSessionValidationFlags(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_SESSION_VALIDATION_FLAGS_TYPE type;
+	CK_FLAGS flags;
+	BEGIN_CALL_32(C_GetSessionValidationFlags);
+	IN_ULONG(session);
+	IN_ULONG(type);
+	PROCESS_CALL((session, type, &flags));
+	OUT_ULONG(flags);
+	END_CALL;
+}
+
+static CK_RV rpc_C_AsyncComplete(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR function_name; CK_ULONG function_name_len;
+	CK_ASYNC_DATA result;
+	BEGIN_CALL_32(C_AsyncComplete);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(function_name, function_name_len);
+	PROCESS_CALL((session, (CK_UTF8CHAR_PTR)function_name, &result));
+	OUT_ULONG(result.hObject);
+	OUT_ULONG(result.hAdditionalObject);
+	END_CALL;
+}
+
+static CK_RV rpc_C_AsyncGetID(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR function_name; CK_ULONG function_name_len;
+	CK_ULONG id;
+	BEGIN_CALL_32(C_AsyncGetID);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(function_name, function_name_len);
+	PROCESS_CALL((session, (CK_UTF8CHAR_PTR)function_name, &id));
+	OUT_ULONG(id);
+	END_CALL;
+}
+
+static CK_RV rpc_C_AsyncJoin(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_BYTE_PTR function_name; CK_ULONG function_name_len;
+	CK_ULONG id;
+	CK_BYTE_PTR data; CK_ULONG data_len;
+	BEGIN_CALL_32(C_AsyncJoin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(function_name, function_name_len);
+	IN_ULONG(id);
+	IN_BYTE_ARRAY(data, data_len);
+	PROCESS_CALL((session, (CK_UTF8CHAR_PTR)function_name, id, data, data_len));
+	END_CALL;
+}
+
+static CK_RV rpc_C_WrapKeyAuthenticated(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE wrapping_key;
+	CK_OBJECT_HANDLE key;
+	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
+	CK_BYTE_PTR wrapped_key;
+	DECLARE_CK_ULONG_PTR(wrapped_key_len);
+	BEGIN_CALL_32(C_WrapKeyAuthenticated);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(wrapping_key);
+	IN_ULONG(key);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	IN_BYTE_BUFFER(wrapped_key, wrapped_key_len);
+	PROCESS_CALL((session, &mechanism, wrapping_key, key, associated_data, associated_data_len, wrapped_key, wrapped_key_len));
+	OUT_BYTE_ARRAY(wrapped_key, wrapped_key_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_UnwrapKeyAuthenticated(CallState *cs)
+{
+	CK_SESSION_HANDLE session;
+	CK_MECHANISM mechanism;
+	CK_OBJECT_HANDLE unwrapping_key;
+	CK_BYTE_PTR wrapped_key; CK_ULONG wrapped_key_len;
+	CK_ATTRIBUTE_PTR template; CK_ULONG template_count;
+	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
+	CK_OBJECT_HANDLE key;
+	BEGIN_CALL_32(C_UnwrapKeyAuthenticated);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(unwrapping_key);
+	IN_BYTE_ARRAY(wrapped_key, wrapped_key_len);
+	IN_ATTRIBUTE_ARRAY(template, template_count);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	PROCESS_CALL((session, &mechanism, unwrapping_key, wrapped_key, wrapped_key_len, template, template_count, associated_data, associated_data_len, &key));
+	OUT_ULONG(key);
+	END_CALL;
+}
+
+/* ---------------------------------------------------------------------------
  * DISPATCH THREAD HANDLING
  */
 
@@ -2099,6 +2597,40 @@ static int dispatch_call(CallState * cs)
 		    CASE_CALL(C_DeriveKey)
 		    CASE_CALL(C_SeedRandom)
 		    CASE_CALL(C_GenerateRandom)
+		    CASE_CALL(C_LoginUser)
+		    CASE_CALL(C_SessionCancel)
+		    CASE_CALL(C_MessageEncryptInit)
+		    CASE_CALL(C_EncryptMessage)
+		    CASE_CALL(C_EncryptMessageBegin)
+		    CASE_CALL(C_EncryptMessageNext)
+		    CASE_CALL(C_MessageEncryptFinal)
+		    CASE_CALL(C_MessageDecryptInit)
+		    CASE_CALL(C_DecryptMessage)
+		    CASE_CALL(C_DecryptMessageBegin)
+		    CASE_CALL(C_DecryptMessageNext)
+		    CASE_CALL(C_MessageDecryptFinal)
+		    CASE_CALL(C_MessageSignInit)
+		    CASE_CALL(C_SignMessage)
+		    CASE_CALL(C_SignMessageBegin)
+		    CASE_CALL(C_SignMessageNext)
+		    CASE_CALL(C_MessageSignFinal)
+		    CASE_CALL(C_MessageVerifyInit)
+		    CASE_CALL(C_VerifyMessage)
+		    CASE_CALL(C_VerifyMessageBegin)
+		    CASE_CALL(C_VerifyMessageNext)
+		    CASE_CALL(C_MessageVerifyFinal)
+		    CASE_CALL(C_EncapsulateKey)
+		    CASE_CALL(C_DecapsulateKey)
+		    CASE_CALL(C_VerifySignatureInit)
+		    CASE_CALL(C_VerifySignature)
+		    CASE_CALL(C_VerifySignatureUpdate)
+		    CASE_CALL(C_VerifySignatureFinal)
+		    CASE_CALL(C_GetSessionValidationFlags)
+		    CASE_CALL(C_AsyncComplete)
+		    CASE_CALL(C_AsyncGetID)
+		    CASE_CALL(C_AsyncJoin)
+		    CASE_CALL(C_WrapKeyAuthenticated)
+		    CASE_CALL(C_UnwrapKeyAuthenticated)
 #undef CASE_CALL
 	default:
 		/* This should have been caught by the parse code */
@@ -2645,6 +3177,12 @@ void gck_rpc_layer_uninitialize(void)
 	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
 
 	pkcs11_module = NULL;
+	pkcs11_module32 = NULL;
+}
+
+void gck_rpc_layer_set_module_v32(CK_FUNCTION_LIST_3_2_PTR funcs32)
+{
+	pkcs11_module32 = funcs32;
 }
 
 /*

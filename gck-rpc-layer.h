@@ -12,6 +12,9 @@
 /* Call to initialize the module and start listening, returns socket or -1 */
 int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR funcs);
 
+/* Optionally set the v3.2 function list for v3.0/v3.2 function dispatch */
+void gck_rpc_layer_set_module_v32(CK_FUNCTION_LIST_3_2_PTR funcs32);
+
 /* Should be called to cleanup dispatcher */
 void gck_rpc_layer_uninitialize(void);
 

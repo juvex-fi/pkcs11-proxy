@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 2.4)
+cmake_minimum_required (VERSION 3.10)
 
 if(COMMAND cmake_policy)
       cmake_policy(SET CMP0003 NEW)
@@ -6,8 +6,22 @@ endif(COMMAND cmake_policy)
 
 project (pkcs11 C)
 
+find_package(OpenSSL REQUIRED)
+include_directories(${OPENSSL_INCLUDE_DIR})
+
+option(PKCS11_V32 "Build against the OASIS PKCS#11 v3.2 headers instead of the legacy g10 Code headers" ON)
+if(PKCS11_V32)
+  message(STATUS "PKCS11: using OASIS v3.2 headers")
+  add_definitions(-DPKCS11_USE_V32)
+else()
+  message(STATUS "PKCS11: using legacy headers")
+endif()
+
 set(PKCS11_PROXY_SRCS gck-rpc-module.c gck-rpc-message.c gck-rpc-util.c egg-buffer.c gck-rpc-tls-psk.c)
-set(PKCS11_DAEMON_SRCS egg-buffer.c gck-rpc-daemon-standalone.c gck-rpc-dispatch.c gck-rpc-message.c gck-rpc-util.c syscall-reporter.c syscall-names.h gck-rpc-tls-psk.c)
+set(PKCS11_DAEMON_SRCS egg-buffer.c gck-rpc-daemon-standalone.c gck-rpc-dispatch.c gck-rpc-message.c gck-rpc-util.c gck-rpc-tls-psk.c)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND PKCS11_DAEMON_SRCS syscall-reporter.c syscall-names.h)
+endif()
 
 add_definitions(-Wall)
 add_library(pkcs11-proxy SHARED ${PKCS11_PROXY_SRCS})
@@ -33,8 +47,12 @@ if (WIN32)
   target_link_libraries (pkcs11-proxy ws2_32)
 endif (WIN32)
 
-target_link_libraries (pkcs11-proxy pthread ssl crypto)
-target_link_libraries (pkcs11-daemon dl pthread ssl crypto seccomp)
+target_link_libraries (pkcs11-proxy pthread ${OPENSSL_LIBRARIES})
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries (pkcs11-daemon dl pthread ${OPENSSL_LIBRARIES} seccomp)
+else()
+  target_link_libraries (pkcs11-daemon dl pthread ${OPENSSL_LIBRARIES})
+endif()
 
 install_targets (/lib pkcs11-proxy)
 install_targets (/bin pkcs11-daemon)

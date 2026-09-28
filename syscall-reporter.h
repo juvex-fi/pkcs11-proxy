@@ -18,7 +18,9 @@
  * we want to make sure it stands out in the build as it should not be
  * used in the final program.
  */
+#ifdef DEBUG_SECCOMP
 #warning "You've included the syscall reporter. Do not use in production!"
+#endif
 #undef KILL_PROCESS
 #define KILL_PROCESS \
 		BPF_STMT(BPF_RET+BPF_K, SECCOMP_RET_TRAP)

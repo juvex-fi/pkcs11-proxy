@@ -108,6 +108,41 @@ enum {
 	GCK_RPC_CALL_C_SeedRandom,
 	GCK_RPC_CALL_C_GenerateRandom,
 
+	GCK_RPC_CALL_C_LoginUser,
+	GCK_RPC_CALL_C_SessionCancel,
+	GCK_RPC_CALL_C_MessageEncryptInit,
+	GCK_RPC_CALL_C_EncryptMessage,
+	GCK_RPC_CALL_C_EncryptMessageBegin,
+	GCK_RPC_CALL_C_EncryptMessageNext,
+	GCK_RPC_CALL_C_MessageEncryptFinal,
+	GCK_RPC_CALL_C_MessageDecryptInit,
+	GCK_RPC_CALL_C_DecryptMessage,
+	GCK_RPC_CALL_C_DecryptMessageBegin,
+	GCK_RPC_CALL_C_DecryptMessageNext,
+	GCK_RPC_CALL_C_MessageDecryptFinal,
+	GCK_RPC_CALL_C_MessageSignInit,
+	GCK_RPC_CALL_C_SignMessage,
+	GCK_RPC_CALL_C_SignMessageBegin,
+	GCK_RPC_CALL_C_SignMessageNext,
+	GCK_RPC_CALL_C_MessageSignFinal,
+	GCK_RPC_CALL_C_MessageVerifyInit,
+	GCK_RPC_CALL_C_VerifyMessage,
+	GCK_RPC_CALL_C_VerifyMessageBegin,
+	GCK_RPC_CALL_C_VerifyMessageNext,
+	GCK_RPC_CALL_C_MessageVerifyFinal,
+	GCK_RPC_CALL_C_EncapsulateKey,
+	GCK_RPC_CALL_C_DecapsulateKey,
+	GCK_RPC_CALL_C_VerifySignatureInit,
+	GCK_RPC_CALL_C_VerifySignature,
+	GCK_RPC_CALL_C_VerifySignatureUpdate,
+	GCK_RPC_CALL_C_VerifySignatureFinal,
+	GCK_RPC_CALL_C_GetSessionValidationFlags,
+	GCK_RPC_CALL_C_AsyncComplete,
+	GCK_RPC_CALL_C_AsyncGetID,
+	GCK_RPC_CALL_C_AsyncJoin,
+	GCK_RPC_CALL_C_WrapKeyAuthenticated,
+	GCK_RPC_CALL_C_UnwrapKeyAuthenticated,
+
 	GCK_RPC_CALL_MAX
 };
 
@@ -204,6 +239,40 @@ static const GckRpcCall gck_rpc_calls[] = {
 	{GCK_RPC_CALL_C_DeriveKey, "C_DeriveKey", "uMuaA", "u"},
 	{GCK_RPC_CALL_C_SeedRandom, "C_SeedRandom", "uay", ""},
 	{GCK_RPC_CALL_C_GenerateRandom, "C_GenerateRandom", "ufy", "ay"},
+	{GCK_RPC_CALL_C_LoginUser, "C_LoginUser", "uuayay", ""},
+	{GCK_RPC_CALL_C_SessionCancel, "C_SessionCancel", "uu", ""},
+	{GCK_RPC_CALL_C_MessageEncryptInit, "C_MessageEncryptInit", "uMu", ""},
+	{GCK_RPC_CALL_C_EncryptMessage, "C_EncryptMessage", "uayayayfy", "ay"},
+	{GCK_RPC_CALL_C_EncryptMessageBegin, "C_EncryptMessageBegin", "uayay", ""},
+	{GCK_RPC_CALL_C_EncryptMessageNext, "C_EncryptMessageNext", "uayayfyu", "ay"},
+	{GCK_RPC_CALL_C_MessageEncryptFinal, "C_MessageEncryptFinal", "u", ""},
+	{GCK_RPC_CALL_C_MessageDecryptInit, "C_MessageDecryptInit", "uMu", ""},
+	{GCK_RPC_CALL_C_DecryptMessage, "C_DecryptMessage", "uayayayfy", "ay"},
+	{GCK_RPC_CALL_C_DecryptMessageBegin, "C_DecryptMessageBegin", "uayay", ""},
+	{GCK_RPC_CALL_C_DecryptMessageNext, "C_DecryptMessageNext", "uayayfyu", "ay"},
+	{GCK_RPC_CALL_C_MessageDecryptFinal, "C_MessageDecryptFinal", "u", ""},
+	{GCK_RPC_CALL_C_MessageSignInit, "C_MessageSignInit", "uMu", ""},
+	{GCK_RPC_CALL_C_SignMessage, "C_SignMessage", "uayayfy", "ay"},
+	{GCK_RPC_CALL_C_SignMessageBegin, "C_SignMessageBegin", "uay", ""},
+	{GCK_RPC_CALL_C_SignMessageNext, "C_SignMessageNext", "uayayfy", "ay"},
+	{GCK_RPC_CALL_C_MessageSignFinal, "C_MessageSignFinal", "u", ""},
+	{GCK_RPC_CALL_C_MessageVerifyInit, "C_MessageVerifyInit", "uMu", ""},
+	{GCK_RPC_CALL_C_VerifyMessage, "C_VerifyMessage", "uayayay", ""},
+	{GCK_RPC_CALL_C_VerifyMessageBegin, "C_VerifyMessageBegin", "uay", ""},
+	{GCK_RPC_CALL_C_VerifyMessageNext, "C_VerifyMessageNext", "uayayay", ""},
+	{GCK_RPC_CALL_C_MessageVerifyFinal, "C_MessageVerifyFinal", "u", ""},
+	{GCK_RPC_CALL_C_EncapsulateKey, "C_EncapsulateKey", "uMuaAfy", "ayu"},
+	{GCK_RPC_CALL_C_DecapsulateKey, "C_DecapsulateKey", "uMuaAay", "u"},
+	{GCK_RPC_CALL_C_VerifySignatureInit, "C_VerifySignatureInit", "uMuay", ""},
+	{GCK_RPC_CALL_C_VerifySignature, "C_VerifySignature", "uay", ""},
+	{GCK_RPC_CALL_C_VerifySignatureUpdate, "C_VerifySignatureUpdate", "uay", ""},
+	{GCK_RPC_CALL_C_VerifySignatureFinal, "C_VerifySignatureFinal", "u", ""},
+	{GCK_RPC_CALL_C_GetSessionValidationFlags, "C_GetSessionValidationFlags", "uu", "u"},
+	{GCK_RPC_CALL_C_AsyncComplete, "C_AsyncComplete", "uay", "uu"},
+	{GCK_RPC_CALL_C_AsyncGetID, "C_AsyncGetID", "uay", "u"},
+	{GCK_RPC_CALL_C_AsyncJoin, "C_AsyncJoin", "uayuay", ""},
+	{GCK_RPC_CALL_C_WrapKeyAuthenticated, "C_WrapKeyAuthenticated", "uMuuayfy", "ay"},
+	{GCK_RPC_CALL_C_UnwrapKeyAuthenticated, "C_UnwrapKeyAuthenticated", "uMuayaAay", "u"},
 };
 
 #ifdef _DEBUG
@@ -212,7 +281,7 @@ static const GckRpcCall gck_rpc_calls[] = {
 #endif
 
 #define GCK_RPC_HANDSHAKE \
-	"PRIVATE-GNOME-KEYRING-PKCS11-PROTOCOL-V-3"
+	"PRIVATE-GNOME-KEYRING-PKCS11-PROTOCOL-V-4"
 #define GCK_RPC_HANDSHAKE_LEN \
 	(sizeof (GCK_RPC_HANDSHAKE) - 1)
 

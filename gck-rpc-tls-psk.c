@@ -265,12 +265,20 @@ gck_rpc_init_tls_psk(GckRpcTlsPskState *state, const char *key_filename,
 
 	assert(caller == GCK_RPC_TLS_PSK_CLIENT || caller == GCK_RPC_TLS_PSK_SERVER);
 
-	state->ssl_ctx = SSL_CTX_new(TLSv1_2_method());
+	/* TLSv1_2_method() is deprecated since OpenSSL 1.1.0; use TLS_method()
+	 * and pin the version range to TLS 1.2 explicitly.
+	 * The max must stay at TLS 1.2: the PSK callbacks set below
+	 * (SSL_CTX_set_psk_*_callback / SSL_CTX_set_cipher_list) use the
+	 * TLS 1.2 PSK API which is not invoked during a TLS 1.3 handshake. */
+	state->ssl_ctx = SSL_CTX_new(TLS_method());
 
 	if (state->ssl_ctx == NULL) {
 		gck_rpc_warn("can't initialize SSL_CTX");
 		return 0;
 	}
+
+	SSL_CTX_set_min_proto_version(state->ssl_ctx, TLS1_2_VERSION);
+	SSL_CTX_set_max_proto_version(state->ssl_ctx, TLS1_2_VERSION);
 
 	/* Set up callback for TLS-PSK initialization */
 	if (caller == GCK_RPC_TLS_PSK_CLIENT)

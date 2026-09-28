@@ -2396,6 +2396,566 @@ rpc_C_GenerateRandom(CK_SESSION_HANDLE session, CK_BYTE_PTR random_data,
 	END_CALL;
 }
 
+/* C_GetInterfaceList and C_GetInterface are handled locally - they return
+ * pointers into this process's function list structures, not from the server. */
+
+static CK_FUNCTION_LIST_3_2 functionList32;
+static CK_FUNCTION_LIST functionList;
+
+static CK_RV rpc_C_GetInterfaceList(CK_INTERFACE_PTR pInterfacesList,
+				     CK_ULONG_PTR pulCount)
+{
+	return_val_if_fail(pulCount != NULL, CKR_ARGUMENTS_BAD);
+
+	if (pInterfacesList == NULL) {
+		*pulCount = 2;
+		return CKR_OK;
+	}
+	if (*pulCount < 2)
+		return CKR_BUFFER_TOO_SMALL;
+
+	pInterfacesList[0].pInterfaceName = (CK_UTF8CHAR_PTR)"PKCS 11";
+	pInterfacesList[0].pFunctionList = &functionList32;
+	pInterfacesList[0].flags = 0;
+
+	pInterfacesList[1].pInterfaceName = (CK_UTF8CHAR_PTR)"PKCS 11";
+	pInterfacesList[1].pFunctionList = &functionList;
+	pInterfacesList[1].flags = 0;
+
+	*pulCount = 2;
+	return CKR_OK;
+}
+
+static CK_RV rpc_C_GetInterface(CK_UTF8CHAR_PTR pInterfaceName,
+				  CK_VERSION_PTR pVersion,
+				  CK_INTERFACE_PTR_PTR ppInterface,
+				  CK_FLAGS flags)
+{
+	static CK_INTERFACE iface32 = {
+		(CK_UTF8CHAR_PTR)"PKCS 11", NULL, 0
+	};
+	static CK_INTERFACE iface20 = {
+		(CK_UTF8CHAR_PTR)"PKCS 11", NULL, 0
+	};
+
+	return_val_if_fail(ppInterface != NULL, CKR_ARGUMENTS_BAD);
+
+	iface32.pFunctionList = &functionList32;
+	iface20.pFunctionList = &functionList;
+
+	/* Return default (highest) interface if no name/version specified */
+	if (pInterfaceName == NULL) {
+		*ppInterface = &iface32;
+		return CKR_OK;
+	}
+
+	if (strcmp((char *)pInterfaceName, "PKCS 11") != 0)
+		return CKR_ARGUMENTS_BAD;
+
+	/* If version requested, match it */
+	if (pVersion != NULL) {
+		if (pVersion->major == 3 && pVersion->minor <= 2) {
+			*ppInterface = &iface32;
+			return CKR_OK;
+		}
+		if (pVersion->major == 2) {
+			*ppInterface = &iface20;
+			return CKR_OK;
+		}
+		return CKR_ARGUMENTS_BAD;
+	}
+
+	*ppInterface = &iface32;
+	return CKR_OK;
+}
+
+static CK_RV rpc_C_LoginUser(CK_SESSION_HANDLE session, CK_USER_TYPE user_type,
+			      CK_UTF8CHAR_PTR pin, CK_ULONG pin_len,
+			      CK_UTF8CHAR_PTR username, CK_ULONG username_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_LoginUser);
+	IN_ULONG(session);
+	IN_ULONG(user_type);
+	IN_BYTE_ARRAY(pin, pin_len);
+	IN_BYTE_ARRAY(username, username_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_SessionCancel(CK_SESSION_HANDLE session, CK_FLAGS flags)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_SessionCancel);
+	IN_ULONG(session);
+	IN_ULONG(flags);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageEncryptInit(CK_SESSION_HANDLE session,
+				       CK_MECHANISM_PTR mechanism,
+				       CK_OBJECT_HANDLE key)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageEncryptInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncryptMessage(CK_SESSION_HANDLE session,
+				   CK_VOID_PTR parameter, CK_ULONG parameter_len,
+				   CK_BYTE_PTR associated_data, CK_ULONG associated_data_len,
+				   CK_BYTE_PTR plaintext, CK_ULONG plaintext_len,
+				   CK_BYTE_PTR ciphertext, CK_ULONG_PTR ciphertext_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_EncryptMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	IN_BYTE_ARRAY(plaintext, plaintext_len);
+	IN_BYTE_BUFFER(ciphertext, ciphertext_len);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(ciphertext, ciphertext_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncryptMessageBegin(CK_SESSION_HANDLE session,
+					CK_VOID_PTR parameter, CK_ULONG parameter_len,
+					CK_BYTE_PTR associated_data, CK_ULONG associated_data_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_EncryptMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncryptMessageNext(CK_SESSION_HANDLE session,
+				       CK_VOID_PTR parameter, CK_ULONG parameter_len,
+				       CK_BYTE_PTR plaintext_part, CK_ULONG plaintext_part_len,
+				       CK_BYTE_PTR ciphertext_part, CK_ULONG_PTR ciphertext_part_len,
+				       CK_FLAGS flags)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_EncryptMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(plaintext_part, plaintext_part_len);
+	IN_BYTE_BUFFER(ciphertext_part, ciphertext_part_len);
+	IN_ULONG(flags);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(ciphertext_part, ciphertext_part_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageEncryptFinal(CK_SESSION_HANDLE session)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageEncryptFinal);
+	IN_ULONG(session);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageDecryptInit(CK_SESSION_HANDLE session,
+				       CK_MECHANISM_PTR mechanism,
+				       CK_OBJECT_HANDLE key)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageDecryptInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecryptMessage(CK_SESSION_HANDLE session,
+				   CK_VOID_PTR parameter, CK_ULONG parameter_len,
+				   CK_BYTE_PTR associated_data, CK_ULONG associated_data_len,
+				   CK_BYTE_PTR ciphertext, CK_ULONG ciphertext_len,
+				   CK_BYTE_PTR plaintext, CK_ULONG_PTR plaintext_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_DecryptMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	IN_BYTE_ARRAY(ciphertext, ciphertext_len);
+	IN_BYTE_BUFFER(plaintext, plaintext_len);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(plaintext, plaintext_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecryptMessageBegin(CK_SESSION_HANDLE session,
+					CK_VOID_PTR parameter, CK_ULONG parameter_len,
+					CK_BYTE_PTR associated_data, CK_ULONG associated_data_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_DecryptMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecryptMessageNext(CK_SESSION_HANDLE session,
+				       CK_VOID_PTR parameter, CK_ULONG parameter_len,
+				       CK_BYTE_PTR ciphertext_part, CK_ULONG ciphertext_part_len,
+				       CK_BYTE_PTR plaintext_part, CK_ULONG_PTR plaintext_part_len,
+				       CK_FLAGS flags)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_DecryptMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(ciphertext_part, ciphertext_part_len);
+	IN_BYTE_BUFFER(plaintext_part, plaintext_part_len);
+	IN_ULONG(flags);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(plaintext_part, plaintext_part_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageDecryptFinal(CK_SESSION_HANDLE session)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageDecryptFinal);
+	IN_ULONG(session);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageSignInit(CK_SESSION_HANDLE session,
+				    CK_MECHANISM_PTR mechanism,
+				    CK_OBJECT_HANDLE key)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageSignInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_SignMessage(CK_SESSION_HANDLE session,
+			       CK_VOID_PTR parameter, CK_ULONG parameter_len,
+			       CK_BYTE_PTR data, CK_ULONG data_len,
+			       CK_BYTE_PTR signature, CK_ULONG_PTR signature_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_SignMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_BUFFER(signature, signature_len);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(signature, signature_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_SignMessageBegin(CK_SESSION_HANDLE session,
+				     CK_VOID_PTR parameter, CK_ULONG parameter_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_SignMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_SignMessageNext(CK_SESSION_HANDLE session,
+				    CK_VOID_PTR parameter, CK_ULONG parameter_len,
+				    CK_BYTE_PTR data, CK_ULONG data_len,
+				    CK_BYTE_PTR signature, CK_ULONG_PTR signature_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_SignMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_BUFFER(signature, signature_len);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(signature, signature_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageSignFinal(CK_SESSION_HANDLE session)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageSignFinal);
+	IN_ULONG(session);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageVerifyInit(CK_SESSION_HANDLE session,
+				      CK_MECHANISM_PTR mechanism,
+				      CK_OBJECT_HANDLE key)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageVerifyInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifyMessage(CK_SESSION_HANDLE session,
+				  CK_VOID_PTR parameter, CK_ULONG parameter_len,
+				  CK_BYTE_PTR data, CK_ULONG data_len,
+				  CK_BYTE_PTR signature, CK_ULONG signature_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_VerifyMessage);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_ARRAY(signature, signature_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifyMessageBegin(CK_SESSION_HANDLE session,
+				       CK_VOID_PTR parameter, CK_ULONG parameter_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_VerifyMessageBegin);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifyMessageNext(CK_SESSION_HANDLE session,
+				      CK_VOID_PTR parameter, CK_ULONG parameter_len,
+				      CK_BYTE_PTR data, CK_ULONG data_len,
+				      CK_BYTE_PTR signature, CK_ULONG signature_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_VerifyMessageNext);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_BYTE_ARRAY(data, data_len);
+	IN_BYTE_ARRAY(signature, signature_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_MessageVerifyFinal(CK_SESSION_HANDLE session)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_MessageVerifyFinal);
+	IN_ULONG(session);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_EncapsulateKey(CK_SESSION_HANDLE session,
+				   CK_MECHANISM_PTR mechanism,
+				   CK_OBJECT_HANDLE public_key,
+				   CK_ATTRIBUTE_PTR tmpl, CK_ULONG tmpl_count,
+				   CK_BYTE_PTR ciphertext, CK_ULONG_PTR ciphertext_len,
+				   CK_OBJECT_HANDLE_PTR key)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_EncapsulateKey);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(public_key);
+	IN_ATTRIBUTE_ARRAY(tmpl, tmpl_count);
+	IN_BYTE_BUFFER(ciphertext, ciphertext_len);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(ciphertext, ciphertext_len);
+	OUT_ULONG(key);
+	END_CALL;
+}
+
+static CK_RV rpc_C_DecapsulateKey(CK_SESSION_HANDLE session,
+				   CK_MECHANISM_PTR mechanism,
+				   CK_OBJECT_HANDLE private_key,
+				   CK_ATTRIBUTE_PTR tmpl, CK_ULONG tmpl_count,
+				   CK_BYTE_PTR ciphertext, CK_ULONG ciphertext_len,
+				   CK_OBJECT_HANDLE_PTR key)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_DecapsulateKey);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(private_key);
+	IN_ATTRIBUTE_ARRAY(tmpl, tmpl_count);
+	IN_BYTE_ARRAY(ciphertext, ciphertext_len);
+	PROCESS_CALL;
+	OUT_ULONG(key);
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignatureInit(CK_SESSION_HANDLE session,
+					CK_MECHANISM_PTR mechanism,
+					CK_OBJECT_HANDLE key,
+					CK_BYTE_PTR signature, CK_ULONG signature_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_VerifySignatureInit);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(key);
+	IN_BYTE_ARRAY(signature, signature_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignature(CK_SESSION_HANDLE session,
+				    CK_BYTE_PTR data, CK_ULONG data_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_VerifySignature);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(data, data_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignatureUpdate(CK_SESSION_HANDLE session,
+					  CK_BYTE_PTR part, CK_ULONG part_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_VerifySignatureUpdate);
+	IN_ULONG(session);
+	IN_BYTE_ARRAY(part, part_len);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_VerifySignatureFinal(CK_SESSION_HANDLE session)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_VerifySignatureFinal);
+	IN_ULONG(session);
+	PROCESS_CALL;
+	END_CALL;
+}
+
+static CK_RV rpc_C_GetSessionValidationFlags(CK_SESSION_HANDLE session,
+					      CK_SESSION_VALIDATION_FLAGS_TYPE type,
+					      CK_FLAGS_PTR flags)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	return_val_if_fail(flags != NULL, CKR_ARGUMENTS_BAD);
+	BEGIN_CALL(C_GetSessionValidationFlags);
+	IN_ULONG(session);
+	IN_ULONG(type);
+	PROCESS_CALL;
+	OUT_ULONG(flags);
+	END_CALL;
+}
+
+static CK_RV rpc_C_AsyncComplete(CK_SESSION_HANDLE session,
+				  CK_UTF8CHAR_PTR function_name,
+				  CK_ASYNC_DATA_PTR result)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	return_val_if_fail(result != NULL, CKR_ARGUMENTS_BAD);
+	{
+		CK_ULONG fname_len = function_name ? strlen((char *)function_name) : 0;
+		BEGIN_CALL(C_AsyncComplete);
+		IN_ULONG(session);
+		IN_BYTE_ARRAY(function_name, fname_len);
+		PROCESS_CALL;
+		OUT_ULONG(&result->hObject);
+		OUT_ULONG(&result->hAdditionalObject);
+		END_CALL;
+	}
+}
+
+static CK_RV rpc_C_AsyncGetID(CK_SESSION_HANDLE session,
+			       CK_UTF8CHAR_PTR function_name,
+			       CK_ULONG_PTR id)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	return_val_if_fail(id != NULL, CKR_ARGUMENTS_BAD);
+	{
+		CK_ULONG fname_len = function_name ? strlen((char *)function_name) : 0;
+		BEGIN_CALL(C_AsyncGetID);
+		IN_ULONG(session);
+		IN_BYTE_ARRAY(function_name, fname_len);
+		PROCESS_CALL;
+		OUT_ULONG(id);
+		END_CALL;
+	}
+}
+
+static CK_RV rpc_C_AsyncJoin(CK_SESSION_HANDLE session,
+			      CK_UTF8CHAR_PTR function_name,
+			      CK_ULONG id,
+			      CK_BYTE_PTR data, CK_ULONG data_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	{
+		CK_ULONG fname_len = function_name ? strlen((char *)function_name) : 0;
+		BEGIN_CALL(C_AsyncJoin);
+		IN_ULONG(session);
+		IN_BYTE_ARRAY(function_name, fname_len);
+		IN_ULONG(id);
+		IN_BYTE_ARRAY(data, data_len);
+		PROCESS_CALL;
+		END_CALL;
+	}
+}
+
+static CK_RV rpc_C_WrapKeyAuthenticated(CK_SESSION_HANDLE session,
+					 CK_MECHANISM_PTR mechanism,
+					 CK_OBJECT_HANDLE wrapping_key,
+					 CK_OBJECT_HANDLE key,
+					 CK_BYTE_PTR associated_data, CK_ULONG associated_data_len,
+					 CK_BYTE_PTR wrapped_key, CK_ULONG_PTR wrapped_key_len)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_WrapKeyAuthenticated);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(wrapping_key);
+	IN_ULONG(key);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	IN_BYTE_BUFFER(wrapped_key, wrapped_key_len);
+	PROCESS_CALL;
+	OUT_BYTE_ARRAY2(wrapped_key, wrapped_key_len);
+	END_CALL;
+}
+
+static CK_RV rpc_C_UnwrapKeyAuthenticated(CK_SESSION_HANDLE session,
+					   CK_MECHANISM_PTR mechanism,
+					   CK_OBJECT_HANDLE unwrapping_key,
+					   CK_BYTE_PTR wrapped_key, CK_ULONG wrapped_key_len,
+					   CK_ATTRIBUTE_PTR tmpl, CK_ULONG tmpl_count,
+					   CK_BYTE_PTR associated_data, CK_ULONG associated_data_len,
+					   CK_OBJECT_HANDLE_PTR key)
+{
+	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
+	BEGIN_CALL(C_UnwrapKeyAuthenticated);
+	IN_ULONG(session);
+	IN_MECHANISM(mechanism);
+	IN_ULONG(unwrapping_key);
+	IN_BYTE_ARRAY(wrapped_key, wrapped_key_len);
+	IN_ATTRIBUTE_ARRAY(tmpl, tmpl_count);
+	IN_BYTE_ARRAY(associated_data, associated_data_len);
+	PROCESS_CALL;
+	OUT_ULONG(key);
+	END_CALL;
+}
+
 /* --------------------------------------------------------------------
  * MODULE ENTRY POINT
  */
@@ -2488,3 +3048,114 @@ CK_RV C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR list)
 	*list = &functionList;
 	return CKR_OK;
 }
+
+/* v3.2 function list - includes all functions including v3.0 and v3.2 additions */
+static CK_FUNCTION_LIST_3_2 functionList32 = {
+	{CRYPTOKI_VERSION_MAJOR, CRYPTOKI_VERSION_MINOR},	/* version */
+	rpc_C_Initialize,
+	rpc_C_Finalize,
+	rpc_C_GetInfo,
+	rpc_C_GetFunctionList,
+	rpc_C_GetSlotList,
+	rpc_C_GetSlotInfo,
+	rpc_C_GetTokenInfo,
+	rpc_C_GetMechanismList,
+	rpc_C_GetMechanismInfo,
+	rpc_C_InitToken,
+	rpc_C_InitPIN,
+	rpc_C_SetPIN,
+	rpc_C_OpenSession,
+	rpc_C_CloseSession,
+	rpc_C_CloseAllSessions,
+	rpc_C_GetSessionInfo,
+	rpc_C_GetOperationState,
+	rpc_C_SetOperationState,
+	rpc_C_Login,
+	rpc_C_Logout,
+	rpc_C_CreateObject,
+	rpc_C_CopyObject,
+	rpc_C_DestroyObject,
+	rpc_C_GetObjectSize,
+	rpc_C_GetAttributeValue,
+	rpc_C_SetAttributeValue,
+	rpc_C_FindObjectsInit,
+	rpc_C_FindObjects,
+	rpc_C_FindObjectsFinal,
+	rpc_C_EncryptInit,
+	rpc_C_Encrypt,
+	rpc_C_EncryptUpdate,
+	rpc_C_EncryptFinal,
+	rpc_C_DecryptInit,
+	rpc_C_Decrypt,
+	rpc_C_DecryptUpdate,
+	rpc_C_DecryptFinal,
+	rpc_C_DigestInit,
+	rpc_C_Digest,
+	rpc_C_DigestUpdate,
+	rpc_C_DigestKey,
+	rpc_C_DigestFinal,
+	rpc_C_SignInit,
+	rpc_C_Sign,
+	rpc_C_SignUpdate,
+	rpc_C_SignFinal,
+	rpc_C_SignRecoverInit,
+	rpc_C_SignRecover,
+	rpc_C_VerifyInit,
+	rpc_C_Verify,
+	rpc_C_VerifyUpdate,
+	rpc_C_VerifyFinal,
+	rpc_C_VerifyRecoverInit,
+	rpc_C_VerifyRecover,
+	rpc_C_DigestEncryptUpdate,
+	rpc_C_DecryptDigestUpdate,
+	rpc_C_SignEncryptUpdate,
+	rpc_C_DecryptVerifyUpdate,
+	rpc_C_GenerateKey,
+	rpc_C_GenerateKeyPair,
+	rpc_C_WrapKey,
+	rpc_C_UnwrapKey,
+	rpc_C_DeriveKey,
+	rpc_C_SeedRandom,
+	rpc_C_GenerateRandom,
+	rpc_C_GetFunctionStatus,
+	rpc_C_CancelFunction,
+	rpc_C_WaitForSlotEvent,
+	/* v3.0 additions */
+	rpc_C_GetInterfaceList,
+	rpc_C_GetInterface,
+	rpc_C_LoginUser,
+	rpc_C_SessionCancel,
+	rpc_C_MessageEncryptInit,
+	rpc_C_EncryptMessage,
+	rpc_C_EncryptMessageBegin,
+	rpc_C_EncryptMessageNext,
+	rpc_C_MessageEncryptFinal,
+	rpc_C_MessageDecryptInit,
+	rpc_C_DecryptMessage,
+	rpc_C_DecryptMessageBegin,
+	rpc_C_DecryptMessageNext,
+	rpc_C_MessageDecryptFinal,
+	rpc_C_MessageSignInit,
+	rpc_C_SignMessage,
+	rpc_C_SignMessageBegin,
+	rpc_C_SignMessageNext,
+	rpc_C_MessageSignFinal,
+	rpc_C_MessageVerifyInit,
+	rpc_C_VerifyMessage,
+	rpc_C_VerifyMessageBegin,
+	rpc_C_VerifyMessageNext,
+	rpc_C_MessageVerifyFinal,
+	/* v3.2 additions */
+	rpc_C_EncapsulateKey,
+	rpc_C_DecapsulateKey,
+	rpc_C_VerifySignatureInit,
+	rpc_C_VerifySignature,
+	rpc_C_VerifySignatureUpdate,
+	rpc_C_VerifySignatureFinal,
+	rpc_C_GetSessionValidationFlags,
+	rpc_C_AsyncComplete,
+	rpc_C_AsyncGetID,
+	rpc_C_AsyncJoin,
+	rpc_C_WrapKeyAuthenticated,
+	rpc_C_UnwrapKeyAuthenticated,
+};
