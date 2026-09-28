@@ -458,7 +458,8 @@ static CK_RV call_connect(CallState * cs)
 	} else {
 		addr.sun_family = AF_UNIX;
 		strncpy(addr.sun_path, pkcs11_socket_path,
-			sizeof(addr.sun_path));
+			sizeof(addr.sun_path) - 1);
+		addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 
 		sock = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (sock < 0) {
@@ -503,8 +504,10 @@ static void call_destroy(void *value)
 		gck_rpc_message_free(cs->req);
 		gck_rpc_message_free(cs->resp);
 
-		if (cs->tls)
+		if (cs->tls) {
 			gck_rpc_close_tls(cs->tls);
+			free(cs->tls);
+		}
 
 		free(cs);
 
@@ -634,6 +637,11 @@ static CK_RV call_send_recv(CallState * cs)
 		goto cleanup;
 
 	len = egg_buffer_decode_uint32(buf);
+	if (len >= PKCS11PROXY_MAX_MESSAGE_SIZE) {
+		warning(("invalid response size from daemon: %u bytes", len));
+		ret = CKR_DEVICE_ERROR;
+		goto cleanup;
+	}
 	if (!egg_buffer_reserve(&resp->buffer, len + resp->buffer.len)) {
 		warning(("couldn't allocate %u byte response area: out of memory", len));
 		ret = CKR_HOST_MEMORY;
@@ -1387,8 +1395,18 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 		}
 	}
 
-	srand(time(NULL) ^ pid);
-	pkcs11_app_id = (uint64_t) rand() << 32 | rand();
+	/* The app id keys this client's sessions in the daemon, so make it
+	 * unguessable; fall back to rand() only if /dev/urandom fails. */
+	{
+		int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+		if (fd < 0 || read(fd, &pkcs11_app_id, sizeof(pkcs11_app_id)) !=
+		    sizeof(pkcs11_app_id)) {
+			srand(time(NULL) ^ pid);
+			pkcs11_app_id = (uint64_t) rand() << 32 | rand();
+		}
+		if (fd >= 0)
+			close(fd);
+	}
 
 	/* Call through and initialize the daemon */
 	ret = call_lookup(&cs);
@@ -1448,6 +1466,17 @@ static CK_RV rpc_C_Finalize(CK_VOID_PTR reserved)
 	pkcs11_initialized = 0;
 	pkcs11_initialized_pid = 0;
 	pkcs11_socket_path[0] = 0;
+
+	/* Drop pooled connections; they belong to the finalized app id */
+	pthread_mutex_lock(&call_state_mutex);
+	while (call_state_pool != NULL) {
+		CallState *pool_cs = call_state_pool;
+		call_state_pool = pool_cs->next;
+		pool_cs->next = NULL;
+		--n_call_state_pool;
+		call_destroy(pool_cs);
+	}
+	pthread_mutex_unlock(&call_state_mutex);
 
 	pthread_mutex_unlock(&init_mutex);
 

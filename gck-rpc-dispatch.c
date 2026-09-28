@@ -98,6 +98,8 @@ typedef struct _DispatchState {
 	struct _DispatchState *next;
 	pthread_t thread;
 	CallState cs;
+	/* Per-connection TLS state; shares the listener's SSL_CTX */
+	GckRpcTlsPskState tls;
 } DispatchState;
 
 /* A linked list of dispatcher threads */
@@ -2800,7 +2802,7 @@ static void run_dispatch_loop(CallState *cs)
 
 		/* Calculate the number of bytes */
 		len = egg_buffer_decode_uint32(buf);
-		if (len >= 0x0FFFFFFF) {
+		if (len >= PKCS11PROXY_MAX_MESSAGE_SIZE) {
 			gck_rpc_warn
 			    ("invalid message size from module: %u bytes", len);
 			break;
@@ -2846,6 +2848,13 @@ static void *run_dispatch_thread(void *arg)
 
 	run_dispatch_loop(cs);
 
+	/* Free the per-connection SSL (and its BIO), but not the shared SSL_CTX */
+	if (cs->tls && cs->tls->ssl) {
+		SSL_free(cs->tls->ssl);
+		cs->tls->ssl = NULL;
+		cs->tls->bio = NULL;
+	}
+
 	/* The thread closes the socket and marks as done */
 	assert(cs->sock != -1);
 	close(cs->sock);
@@ -2886,6 +2895,7 @@ void gck_rpc_layer_accept(GckRpcTlsPskState *tls)
 			here = &ds->next;
 		}
 	}
+	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
 
 	addrlen = sizeof(addr);
 	new_fd = accept(pkcs11_socket, (struct sockaddr *)&addr, &addrlen);
@@ -2907,7 +2917,14 @@ void gck_rpc_layer_accept(GckRpcTlsPskState *tls)
         ds->cs.write = &write_all;
 	ds->cs.addr = addr;
 	ds->cs.addrlen = addrlen;
-	ds->cs.tls = tls;
+	if (tls) {
+		/* Each connection needs its own SSL object; sharing the
+		 * listener's state would let threads clobber each other's. */
+		ds->tls.initialized = tls->initialized;
+		ds->tls.ssl_ctx = tls->ssl_ctx;
+		ds->tls.type = tls->type;
+		ds->cs.tls = &ds->tls;
+	}
 
 	error = pthread_create(&ds->thread, NULL,
 			       run_dispatch_thread, &(ds->cs));
@@ -2918,21 +2935,48 @@ void gck_rpc_layer_accept(GckRpcTlsPskState *tls)
 		return;
 	}
 
+	pthread_mutex_lock(&pkcs11_dispatchers_mutex);
 	ds->next = pkcs11_dispatchers;
 	pkcs11_dispatchers = ds;
 	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
 }
 
+/* Like read_all()/write_all(): return 1 once all of len is transferred,
+ * 0 on EOF or error. */
 static int _inetd_read(CallState *cs, void *data, size_t len)
 {
+	unsigned char *ptr = data;
+	ssize_t r;
+
 	assert(cs->sock >= 0);
-	return read(cs->sock, data, len);
+	while (len > 0) {
+		r = read(cs->sock, ptr, len);
+		if (r < 0 && (errno == EINTR || errno == EAGAIN))
+			continue;
+		if (r <= 0)
+			return 0;
+		ptr += r;
+		len -= r;
+	}
+	return 1;
 }
 
 static int _inetd_write(CallState *cs, void *data, size_t len)
 {
+	unsigned char *ptr = data;
+	ssize_t r;
+
 	assert(cs->sock >= 0);
-	return write(cs->sock, data, len);
+	while (len > 0) {
+		r = write(cs->sock, ptr, len);
+		if (r < 0 && (errno == EINTR || errno == EAGAIN))
+			continue;
+		if (r <= 0)
+			return 0;
+		ptr += r;
+		len -= r;
+	}
+	return 1;
 }
 
 void gck_rpc_layer_inetd(CK_FUNCTION_LIST_PTR module)
@@ -3113,7 +3157,8 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 		addr.sun_family = AF_UNIX;
 		unlink(pkcs11_socket_path);
 		strncpy(addr.sun_path, pkcs11_socket_path,
-			sizeof(addr.sun_path));
+			sizeof(addr.sun_path) - 1);
+		addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 
 		if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 			gck_rpc_warn("couldn't bind to pkcs11 socket: %s: %s",
