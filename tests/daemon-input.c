@@ -305,6 +305,7 @@ static void test_templates(void)
 	blob_u32(&b, 1); blob_u32(&b, CKA_CLASS); blob_u8(&b, 1); blob_u32(&b, 0); blob_u8(&b, 0);
 	fresh(); add_attr(CKA_WRAP_TEMPLATE, b.p, b.len, 5 * 24);
 	CHECK(read_attrs(&a, &n) == CKR_ATTRIBUTE_VALUE_INVALID, "length not matching the nested count refused");
+	free(b.p);
 	/* value claimed but not provided */
 	memset(&b, 0, sizeof b);
 	blob_u32(&b, 1); blob_u32(&b, CKA_LABEL); blob_u8(&b, 1); blob_u32(&b, 1000); blob_u8(&b, 0);

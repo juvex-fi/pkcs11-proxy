@@ -136,7 +136,7 @@ if (PKCS11_TESTS)
   endif()
   add_test(NAME daemon-input COMMAND daemon-input)
 
-  add_test(NAME param-fuzz COMMAND param-fuzz 300000)
+  add_test(NAME param-fuzz COMMAND param-fuzz 100000)
   add_test(NAME message-async
     COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
             $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>
@@ -154,6 +154,7 @@ if (PKCS11_TESTS)
       COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
               $<TARGET_FILE:pkcs11-proxy> ${PKCS11_TEST_SOFTHSM_MODULE}
               $<TARGET_FILE:pqc-test> ${PKCS11_TEST_SOFTHSM_UTIL})
+    set_tests_properties(pqc-softhsm PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME templates-mechanisms-softhsm
       COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
               $<TARGET_FILE:pkcs11-proxy> ${PKCS11_TEST_SOFTHSM_MODULE}

@@ -1,7 +1,8 @@
 /*
  * ML-KEM / ML-DSA through the proxy against a real module (SoftHSM built with
  * ML-DSA and ML-KEM). Usage: pqc-test <libpkcs11-proxy> ; the token must have
- * user PIN 1234. C_VerifySignatureInit is skipped when the module lacks it.
+ * user PIN 1234. Exits 77 (skipped) when the module has no ML-KEM/ML-DSA;
+ * C_VerifySignatureInit is skipped when the module lacks it.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +43,11 @@ int main(int argc, char **argv)
 	for (CK_ULONG i = 0; i < nm; i++) {
 		if (mechs[i] == CKM_ML_KEM) has_kem = 1;
 		if (mechs[i] == CKM_ML_DSA) has_dsa = 1;
+	}
+	if (!has_kem && !has_dsa) {
+		/* e.g. SoftHSM built against an OpenSSL older than 3.5 */
+		printf("skip: the module offers neither ML-KEM nor ML-DSA\n");
+		return 77;
 	}
 	CHECK(has_kem, "CKM_ML_KEM listed");
 	CHECK(has_dsa, "CKM_ML_DSA listed");
