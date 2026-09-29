@@ -1031,101 +1031,17 @@ proto_read_ulong_array(GckRpcMessage * msg, CK_ULONG_PTR arr,
 	return egg_buffer_has_error(&msg->buffer) ? PARSE_ERROR : CKR_OK;
 }
 
-#ifdef CKM_ML_DSA
-/* Serialize the optional additional context of ML-DSA/SLH-DSA mechanisms;
- * see GCK_RPC_CONTEXT_* in gck-rpc-private.h for the wire format. */
-static CK_RV proto_write_context_parameter(GckRpcMessage * msg,
-					   CK_MECHANISM_PTR mech)
+static CK_RV proto_write_mechanism(GckRpcMessage * msg, CK_MECHANISM_PTR mech)
 {
-	unsigned char blob[16 + GCK_RPC_CONTEXT_MAX_LEN];
-	CK_HEDGE_TYPE hedge;
-	CK_MECHANISM_TYPE hash = 0;
-	CK_BYTE_PTR ctx;
-	CK_ULONG ctx_len, expect, off = 0;
-	int i, hashed;
-
-	hashed = gck_rpc_mechanism_context_kind(mech->mechanism) ==
-		 GCK_RPC_CONTEXT_HASH_SIGN;
-	expect = hashed ? sizeof(CK_HASH_SIGN_ADDITIONAL_CONTEXT) :
-			  sizeof(CK_SIGN_ADDITIONAL_CONTEXT);
-
-	if (mech->pParameter == NULL && mech->ulParameterLen == 0) {
-		/* No context given: send an empty parameter */
-		egg_buffer_add_byte_array(&msg->buffer, NULL, 0);
-		return egg_buffer_has_error(&msg->buffer) ? CKR_HOST_MEMORY : CKR_OK;
-	}
-	if (mech->pParameter == NULL || mech->ulParameterLen != expect)
-		return CKR_MECHANISM_PARAM_INVALID;
-
-	if (hashed) {
-		CK_HASH_SIGN_ADDITIONAL_CONTEXT *p = mech->pParameter;
-		hedge = p->hedgeVariant; hash = p->hash;
-		ctx = p->pContext; ctx_len = p->ulContextLen;
-	} else {
-		CK_SIGN_ADDITIONAL_CONTEXT *p = mech->pParameter;
-		hedge = p->hedgeVariant;
-		ctx = p->pContext; ctx_len = p->ulContextLen;
-	}
-	if (ctx_len > GCK_RPC_CONTEXT_MAX_LEN || (ctx_len != 0 && ctx == NULL))
-		return CKR_MECHANISM_PARAM_INVALID;
-
-	for (i = 7; i >= 0; --i)
-		blob[off++] = (unsigned char)((uint64_t)hedge >> (8 * i));
-	if (hashed)
-		for (i = 7; i >= 0; --i)
-			blob[off++] = (unsigned char)((uint64_t)hash >> (8 * i));
-	if (ctx_len)
-		memcpy(blob + off, ctx, ctx_len);
-	egg_buffer_add_byte_array(&msg->buffer, blob, off + ctx_len);
-
-	return egg_buffer_has_error(&msg->buffer) ? CKR_HOST_MEMORY : CKR_OK;
-}
-#endif
-
-#ifdef GCK_RPC_HAVE_V32
-/* Serialize CK_GCM_PARAMS, CK_CCM_PARAMS and friends field by field */
-static CK_RV proto_write_aead_parameter(GckRpcMessage * msg,
-					CK_MECHANISM_PTR mech)
-{
-	const GckRpcParamDesc *d = gck_rpc_param_desc_for_mechanism(mech->mechanism);
-	size_t cap = 1 + 8 * GCK_RPC_PARAM_MAX_FIELDS + 2 * GCK_RPC_PARAM_MAX_BUF;
-	unsigned char *blob;
+	unsigned char *blob = NULL;
 	size_t n = 0;
 	CK_RV rv;
 
-	if (mech->pParameter == NULL && mech->ulParameterLen == 0) {
-		/* Message-mode mechanisms carry their parameters per call */
-		egg_buffer_add_byte_array(&msg->buffer, NULL, 0);
-		return egg_buffer_has_error(&msg->buffer) ? CKR_HOST_MEMORY : CKR_OK;
-	}
-	if (mech->pParameter == NULL || mech->ulParameterLen != d->size)
-		return CKR_MECHANISM_PARAM_INVALID;
-
-	blob = malloc(cap);
-	if (blob == NULL)
-		return CKR_HOST_MEMORY;
-	rv = gck_rpc_param_encode(d, mech->pParameter, GCK_RPC_PHASE_MECH,
-				  blob, cap, &n);
-	if (rv == CKR_OK) {
-		egg_buffer_add_byte_array(&msg->buffer, blob, n);
-		if (egg_buffer_has_error(&msg->buffer))
-			rv = CKR_HOST_MEMORY;
-	}
-	free(blob);
-	return rv;
-}
-#endif
-
-static CK_RV proto_write_mechanism(GckRpcMessage * msg, CK_MECHANISM_PTR mech)
-{
 	assert(msg);
 	assert(mech);
 
 	/* Make sure this is in the right order */
 	assert(!msg->signature || gck_rpc_message_verify_part(msg, "M"));
-
-	/* The mechanism type */
-	egg_buffer_add_uint32(&msg->buffer, mech->mechanism);
 
 	/*
 	 * PKCS#11 mechanism parameters are not easy to serialize. They're
@@ -1133,34 +1049,44 @@ static CK_RV proto_write_mechanism(GckRpcMessage * msg, CK_MECHANISM_PTR mech)
 	 * pointers to arbitrary memory, and many callers don't initialize
 	 * them completely or properly.
 	 *
-	 * We only support certain mechanisms.
+	 * We only support certain mechanisms (see gck-rpc-params.c).
 	 *
 	 * Also callers do yucky things like leaving parts of the structure
 	 * pointing to garbage if they don't think it's going to be used.
 	 */
+	rv = gck_rpc_mech_param_encode(mech, &blob, &n);
+	if (rv != CKR_OK)
+		return rv;
 
-	if (gck_rpc_mechanism_has_no_parameters(mech->mechanism))
-		egg_buffer_add_byte_array(&msg->buffer, NULL, 0);
-	else if (gck_rpc_mechanism_has_sane_parameters(mech->mechanism)) {
-		if ((mech->pParameter == NULL && mech->ulParameterLen != 0) ||
-		    !gck_rpc_mechanism_flat_param_len_ok(mech->mechanism,
-							 mech->ulParameterLen))
-			return CKR_MECHANISM_PARAM_INVALID;
-		egg_buffer_add_byte_array(&msg->buffer, mech->pParameter,
-					  mech->ulParameterLen);
-	}
-#ifdef CKM_ML_DSA
-	else if (gck_rpc_mechanism_context_kind(mech->mechanism))
-		return proto_write_context_parameter(msg, mech);
-#endif
-#ifdef GCK_RPC_HAVE_V32
-	else if (gck_rpc_param_desc_for_mechanism(mech->mechanism))
-		return proto_write_aead_parameter(msg, mech);
-#endif
-	else
-		return CKR_MECHANISM_INVALID;
+	/* The mechanism type */
+	egg_buffer_add_uint32(&msg->buffer, mech->mechanism);
+	egg_buffer_add_byte_array(&msg->buffer, blob, n);
+	free(blob);
 
 	return egg_buffer_has_error(&msg->buffer) ? CKR_HOST_MEMORY : CKR_OK;
+}
+
+/*
+ * Some mechanisms return values through their parameter (a protocol version,
+ * an IV, key handles, PRF output). The daemon sends them after the key.
+ */
+static CK_RV proto_apply_mech_output(GckRpcMessage * msg, CK_MECHANISM_PTR mech)
+{
+	const unsigned char *val;
+	unsigned char valid;
+	size_t vlen = 0;
+
+	assert(!msg->signature || gck_rpc_message_verify_part(msg, "ay"));
+	if (!egg_buffer_get_byte(&msg->buffer, msg->parsed, &msg->parsed, &valid))
+		return PARSE_ERROR;
+	if (!valid || !egg_buffer_get_byte_array(&msg->buffer, msg->parsed,
+						 &msg->parsed, &val, &vlen))
+		return PARSE_ERROR;
+	if (gck_rpc_mech_param_apply_resp(mech, val, vlen) != CKR_OK) {
+		warning(("invalid mechanism output in reply"));
+		return PARSE_ERROR;
+	}
+	return CKR_OK;
 }
 
 static CK_RV proto_read_info(GckRpcMessage * msg, CK_INFO_PTR info)
@@ -2441,6 +2367,8 @@ rpc_C_GenerateKey(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism,
 	IN_ATTRIBUTE_ARRAY(template, count);
 	PROCESS_CALL;
 	OUT_ULONG(key);
+	if (_ret == CKR_OK)
+		_ret = proto_apply_mech_output(_cs->resp, mechanism);
 	END_CALL;
 }
 
@@ -2521,6 +2449,8 @@ rpc_C_DeriveKey(CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism,
 	IN_ATTRIBUTE_ARRAY(template, count);
 	PROCESS_CALL;
 	OUT_ULONG(key);
+	if (_ret == CKR_OK)
+		_ret = proto_apply_mech_output(_cs->resp, mechanism);
 	END_CALL;
 }
 

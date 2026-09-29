@@ -232,11 +232,11 @@ static const GckRpcCall gck_rpc_calls[] = {
 	 "ay"},
 	{GCK_RPC_CALL_C_DecryptVerifyUpdate, "C_DecryptVerifyUpdate", "uayfy",
 	 "ay"},
-	{GCK_RPC_CALL_C_GenerateKey, "C_GenerateKey", "uMaA", "u"},
+	{GCK_RPC_CALL_C_GenerateKey, "C_GenerateKey", "uMaA", "uay"},
 	{GCK_RPC_CALL_C_GenerateKeyPair, "C_GenerateKeyPair", "uMaAaA", "uu"},
 	{GCK_RPC_CALL_C_WrapKey, "C_WrapKey", "uMuufy", "ay"},
 	{GCK_RPC_CALL_C_UnwrapKey, "C_UnwrapKey", "uMuayaA", "u"},
-	{GCK_RPC_CALL_C_DeriveKey, "C_DeriveKey", "uMuaA", "u"},
+	{GCK_RPC_CALL_C_DeriveKey, "C_DeriveKey", "uMuaA", "uay"},
 	{GCK_RPC_CALL_C_SeedRandom, "C_SeedRandom", "uay", ""},
 	{GCK_RPC_CALL_C_GenerateRandom, "C_GenerateRandom", "ufy", "ay"},
 	{GCK_RPC_CALL_C_LoginUser, "C_LoginUser", "uuayay", ""},
@@ -415,26 +415,38 @@ int gck_rpc_mechanism_context_kind(CK_MECHANISM_TYPE mech);
 #define GCK_RPC_PARAM_MAX_BUF	65536
 #define GCK_RPC_MSGPARAM_BLOB	2400	/* stack blob for message params */
 #define GCK_RPC_PARAM_MAX_FIELDS 10
-#define GCK_RPC_PARAM_MAX_DEPTH	2	/* a structure, and one it points to */
+#define GCK_RPC_PARAM_MAX_DEPTH	3	/* a structure, what it points to, and one more */
 
 /* Kinds of structure member */
-#define GCK_RPC_F_ULONG		0	/* CK_ULONG (or a handle, type, ...) */
-#define GCK_RPC_F_BUF		1	/* CK_BYTE_PTR, its length in another member */
+#define GCK_RPC_F_ULONG		0	/* CK_ULONG (or a handle, a type, ...) */
+#define GCK_RPC_F_BUF		1	/* CK_BYTE_PTR; its length is in another member */
 #define GCK_RPC_F_BBOOL		2	/* CK_BBOOL */
 #define GCK_RPC_F_INLINE	3	/* CK_BYTE array[n] inside the structure */
 #define GCK_RPC_F_STRUCT	4	/* pointer to another described structure */
+#define GCK_RPC_F_BYTE		5	/* CK_BYTE */
+#define GCK_RPC_F_OBUF		6	/* like BUF, but the pointer may be NULL */
+#define GCK_RPC_F_ISTRUCT	7	/* another described structure, embedded */
+#define GCK_RPC_F_ULONGPTR	8	/* pointer to a CK_ULONG */
+#define GCK_RPC_F_ARRAY		9	/* pointer to an array of described structures */
+#define GCK_RPC_F_ATTRS		10	/* pointer to a CK_ATTRIBUTE array */
+#define GCK_RPC_F_CSTR		11	/* NUL-terminated string */
+#define GCK_RPC_F_MECHPTR	12	/* pointer to a CK_MECHANISM */
+
+/* Flags of a length (buf) or count (array, attrs) taken from another member */
+#define GCK_RPC_LEN_BITS	1	/* the member counts bits */
+#define GCK_RPC_LEN_PARENT	2	/* the member is in the enclosing structure */
 
 struct GckRpcParamDesc;
 
 typedef struct {
 	int type;		/* GCK_RPC_F_* */
 	size_t off;		/* offset in the CK_* structure */
-	int len_idx;		/* buf: index of the member giving its length */
-	int len_bits;		/* buf: that member counts bits */
-	size_t len_fixed;	/* buf (len_idx < 0) / inline: length in bytes */
+	int len_idx;		/* length/count member (-1: len_fixed) */
+	int flags;		/* GCK_RPC_LEN_* */
+	size_t len_fixed;	/* fixed length in bytes (buf without len_idx, inline) */
 	int req;		/* phases in which the bytes are sent */
-	int resp;		/* buf: returned after an encrypt-message call */
-	const struct GckRpcParamDesc *sub;	/* struct: what it points to */
+	int resp;		/* the module writes this: return it in the reply */
+	const struct GckRpcParamDesc *sub;	/* struct, istruct, array */
 } GckRpcParamField;
 
 typedef struct GckRpcParamDesc {
@@ -456,18 +468,35 @@ typedef struct {
 		CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS chacha_msg;
 		CK_RSA_PKCS_OAEP_PARAMS oaep;
 		CK_ECDH1_DERIVE_PARAMS ecdh1;
-		CK_ECDH_AES_KEY_WRAP_PARAMS ecdh_wrap;
 		CK_HKDF_PARAMS hkdf;
 		CK_EDDSA_PARAMS eddsa;
-		CK_CHACHA20_PARAMS chacha20;
-		CK_SALSA20_PARAMS salsa20;
-		CK_KEY_DERIVATION_STRING_DATA strdata;
-		CK_AES_CBC_ENCRYPT_DATA_PARAMS aes_cbc_data;
-		CK_DES_CBC_ENCRYPT_DATA_PARAMS des_cbc_data;
 		CK_RSA_AES_KEY_WRAP_PARAMS rsa_aes_wrap;
+		CK_ULONG align;
+		unsigned char raw[192];		/* the largest structure */
 	} s;
-	size_t lens[GCK_RPC_PARAM_MAX_FIELDS];
+	size_t lens[GCK_RPC_PARAM_MAX_FIELDS];	/* capacity of each top-level buffer */
 } GckRpcParamState;
+
+const GckRpcParamDesc *const *gck_rpc_param_descs(size_t *n);
+const GckRpcParamDesc *gck_rpc_param_desc_select(CK_MECHANISM_TYPE mech,
+						 const void *param, CK_ULONG len);
+CK_RV gck_rpc_param_resp_encode_alloc(const GckRpcParamState *st,
+				      unsigned char **out, size_t *out_len);
+CK_RV gck_rpc_param_encode_alloc(const GckRpcParamDesc *d, const void *param,
+				 int phase, unsigned char **out, size_t *out_len);
+
+/* A whole mechanism parameter: mechanism -> blob (malloc'd; may be empty) */
+CK_RV gck_rpc_mech_param_encode(const CK_MECHANISM *mech, unsigned char **blob,
+				size_t *n);
+/* blob -> mechanism whose parameter lives in memory from `alloc`; `st` holds
+ * the structure and remembers what to return to the client */
+CK_RV gck_rpc_mech_param_decode(CK_MECHANISM_TYPE type, const unsigned char *blob,
+				size_t n, void *(*alloc)(void *, size_t),
+				void *ctx, CK_MECHANISM_PTR out,
+				GckRpcParamState *st);
+/* the module's reply, applied to the caller's structure (client) */
+CK_RV gck_rpc_mech_param_apply_resp(const CK_MECHANISM *mech,
+				    const unsigned char *blob, size_t n);
 
 const GckRpcParamDesc *gck_rpc_param_desc_for_mechanism(CK_MECHANISM_TYPE mech);
 const GckRpcParamDesc *gck_rpc_param_desc_for_message(CK_ULONG param_len);

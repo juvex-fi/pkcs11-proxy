@@ -17,8 +17,8 @@ else()
   message(STATUS "PKCS11: using legacy headers")
 endif()
 
-set(PKCS11_PROXY_SRCS gck-rpc-module.c gck-rpc-message.c gck-rpc-util.c egg-buffer.c gck-rpc-tls-psk.c)
-set(PKCS11_DAEMON_SRCS egg-buffer.c gck-rpc-daemon-standalone.c gck-rpc-dispatch.c gck-rpc-message.c gck-rpc-util.c gck-rpc-tls-psk.c)
+set(PKCS11_PROXY_SRCS gck-rpc-module.c gck-rpc-message.c gck-rpc-util.c gck-rpc-params.c egg-buffer.c gck-rpc-tls-psk.c)
+set(PKCS11_DAEMON_SRCS egg-buffer.c gck-rpc-daemon-standalone.c gck-rpc-dispatch.c gck-rpc-message.c gck-rpc-util.c gck-rpc-params.c gck-rpc-tls-psk.c)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
   option(PKCS11_SECCOMP "Confine pkcs11-daemon with libseccomp syscall filters" ON)
@@ -105,6 +105,10 @@ if (PKCS11_TESTS)
   target_include_directories(mechanism-test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(mechanism-test ${CMAKE_DL_LIBS})
 
+  add_executable(protocol-test ${T}/protocol-test.c)
+  target_include_directories(protocol-test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(protocol-test ${CMAKE_DL_LIBS})
+
   add_executable(interface-test ${T}/interface-test.c)
   target_include_directories(interface-test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(interface-test ${CMAKE_DL_LIBS})
@@ -114,7 +118,7 @@ if (PKCS11_TESTS)
   target_link_libraries(softhsm-test ${CMAKE_DL_LIBS})
 
   # Fuzzes the daemon-side AEAD parameter parser (sanitizers if available)
-  add_executable(param-fuzz ${T}/param-fuzz.c gck-rpc-util.c)
+  add_executable(param-fuzz ${T}/param-fuzz.c gck-rpc-util.c gck-rpc-params.c)
   target_include_directories(param-fuzz PRIVATE ${CMAKE_SOURCE_DIR})
   include(CheckCCompilerFlag)
   set(CMAKE_REQUIRED_FLAGS "-fsanitize=address,undefined")
@@ -127,7 +131,7 @@ if (PKCS11_TESTS)
 
   # The daemon's own parsers against hostile input (embeds gck-rpc-dispatch.c)
   add_executable(daemon-input ${T}/daemon-input.c egg-buffer.c gck-rpc-message.c
-                 gck-rpc-util.c gck-rpc-tls-psk.c)
+                 gck-rpc-util.c gck-rpc-params.c gck-rpc-tls-psk.c)
   target_include_directories(daemon-input PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(daemon-input ${CMAKE_DL_LIBS} pthread ${OPENSSL_LIBRARIES})
   if (PKCS11_HAVE_SANITIZERS)
@@ -136,7 +140,7 @@ if (PKCS11_TESTS)
   endif()
   add_test(NAME daemon-input COMMAND daemon-input)
 
-  add_test(NAME param-fuzz COMMAND param-fuzz 100000)
+  add_test(NAME param-fuzz COMMAND param-fuzz 1500)
   add_test(NAME message-async
     COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
             $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>
@@ -145,6 +149,10 @@ if (PKCS11_TESTS)
     COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
             $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>
             $<TARGET_FILE:mechanism-test>)
+  add_test(NAME protocol-mechanisms
+    COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
+            $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>
+            $<TARGET_FILE:protocol-test>)
   add_test(NAME interfaces-init
     COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
             $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>

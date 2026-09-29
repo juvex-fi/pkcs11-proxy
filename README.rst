@@ -28,24 +28,37 @@ parameter checks itself, and never hands the module a pointer received from a
 client. Mechanism parameters and attribute templates that contain pointers are
 serialized field by field and rebuilt in the daemon's memory.
 
-Supported mechanisms (about 350 of the 470 names in the header):
+Supported mechanisms (442 of the 472 names in the header):
 
-- everything without a parameter, digests, HMACs and key generation/derivation
-  (SHA-2, SHA-3, BLAKE2b, ...), RSA/ECDSA/DSA with hashes, EdDSA
+- everything without a parameter: digests, HMACs, key generation and
+  derivation (SHA-2, SHA-3, BLAKE2b, ...), RSA/ECDSA/DSA with hashes, EdDSA
 - post-quantum: ML-KEM, ML-DSA, SLH-DSA, HSS and XMSS, including the optional
   signing context
 - structures with pointers: AES-GCM/CCM and ChaCha20/Salsa20-Poly1305 (also
   in the message-based API), RSA-OAEP, RSA-AES key wrap, ECDH derive and
   ECDH-AES wrap, HKDF, EdDSA context, ChaCha20/Salsa20, key derivation from
-  data, ``*_ENCRYPT_DATA``
-- flat parameters: RSA-PSS, IVs, AES-CTR, key wrap, general-length MACs, ...
+  data, ``*_ENCRYPT_DATA``, IKE, X9.42/ECMQV/KEA/GOST key agreement, RC5, OTP
+  (an array of typed values), and parameters that hold another mechanism
+  (KIP, CMS)
+- parameters the module fills in, returned to the caller: SSL/TLS/WTLS master
+  secrets (protocol version), key material (four key handles and IVs), the
+  TLS/WTLS PRFs (output and its length), PBE (the derived IV) and SP 800-108
+  KDFs (the additional keys)
+- flat parameters: RSA-PSS, IVs, AES-CTR, key wrap, general-length MACs, TLS
+  MACs, ...
 
-Not supported (refused, and left out of ``C_GetMechanismList``): the
-protocol-specific mechanisms that return values through their parameter or
-carry arrays of structures (TLS/SSL/WTLS/IKE PRF and key derivation, X3DH,
-X2Ratchet, SP800-108 KDFs, PKCS5-PBKDF2, PBE), plus obsolete ones (Skipjack,
-Baton, Juniper, KEA, GOST, SecurID/HOTP/ACTI, RC5 CBC, ECMQV, X9.42 DH, AES-XTS
-and the SHA512/t family).
+``CKM_PKCS5_PBKD2`` takes ``CK_PKCS5_PBKD2_PARAMS2``, but programs written for
+the older header pass ``CK_PKCS5_PBKD2_PARAMS`` (a pointer to the password
+length). The two have the same size; the last member tells them apart (a
+length is far below 4 KiB, a pointer is not), and the module gets the form the
+caller used.
+
+Not supported (refused, and left out of ``C_GetMechanismList``):
+
+- X3DH and X2Ratchet: their structures hold byte buffers without a length
+  member, so the daemon can't know how much to copy
+- the Skipjack, Baton and Juniper modes and GOST 28147: obsolete hardware,
+  and their parameter sizes can't be confirmed from the header
 
 Tests
 =====

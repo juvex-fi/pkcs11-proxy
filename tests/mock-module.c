@@ -5,6 +5,7 @@
  * receives and writes deterministic outputs (IV byte i = 0xB0 + i, tag 0xA5).
  */
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include "pkcs11/v3.2/pkcs11-platform.h"
 #include "pkcs11/v3.2/pkcs11.h"
@@ -62,6 +63,9 @@ static CK_RV m_EncryptInit(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HA
 	return CKR_OK;
 }
 
+
+#define REQ(c) do { if (!(c)) return CKR_MECHANISM_PARAM_INVALID; } while (0)
+static int mem_is(const void *p, const char *s, size_t n) { return p && memcmp(p, s, n) == 0; }
 /* ---- parameters of derive / sign / wrap mechanisms ---- */
 static CK_RV m_DeriveKey(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HANDLE base,
 	CK_ATTRIBUTE_PTR t, CK_ULONG n, CK_OBJECT_HANDLE_PTR key)
@@ -119,6 +123,212 @@ static CK_RV m_DeriveKey(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HAND
 		return CKR_OK;
 	case CKM_SHA256_KEY_DERIVATION:
 		return m->pParameter == NULL && m->ulParameterLen == 0 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+
+	/* ---- SSL/TLS/WTLS: values come back through the parameter ---- */
+	case CKM_TLS_MASTER_KEY_DERIVE: {
+		CK_SSL3_MASTER_KEY_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && m->ulParameterLen == sizeof *p);
+		REQ(p->RandomInfo.ulClientRandomLen == 8 && mem_is(p->RandomInfo.pClientRandom, "clientRn", 8));
+		REQ(p->RandomInfo.ulServerRandomLen == 8 && mem_is(p->RandomInfo.pServerRandom, "serverRn", 8));
+		REQ(p->pVersion && p->pVersion->major == 3 && p->pVersion->minor == 1);
+		p->pVersion->major = 3; p->pVersion->minor = 3;	/* the negotiated version */
+		*key = 0x100;
+		return CKR_OK;
+	}
+	case CKM_TLS12_MASTER_KEY_DERIVE: {
+		CK_TLS12_MASTER_KEY_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && m->ulParameterLen == sizeof *p && p->prfHashMechanism == CKM_SHA256);
+		REQ(mem_is(p->RandomInfo.pClientRandom, "clientRn", 8) && mem_is(p->RandomInfo.pServerRandom, "serverRn", 8));
+		REQ(p->pVersion == NULL);	/* a NULL output pointer stays NULL */
+		*key = 0x101;
+		return CKR_OK;
+	}
+	case CKM_TLS12_EXTENDED_MASTER_KEY_DERIVE: {
+		CK_TLS12_EXTENDED_MASTER_KEY_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->prfHashMechanism == CKM_SHA384 && p->ulSessionHashLen == 32 && p->pSessionHash);
+		for (i = 0; i < 32; i++) REQ(p->pSessionHash[i] == (CK_BYTE)(i ^ 0x5a));
+		REQ(p->pVersion);
+		p->pVersion->major = 3; p->pVersion->minor = 4;
+		*key = 0x102;
+		return CKR_OK;
+	}
+	case CKM_TLS12_KEY_AND_MAC_DERIVE: {
+		CK_TLS12_KEY_MAT_PARAMS *p = m->pParameter;
+		REQ(p && m->ulParameterLen == sizeof *p && p->prfHashMechanism == CKM_SHA384);
+		REQ(p->ulMacSizeInBits == 256 && p->ulKeySizeInBits == 128 && p->ulIVSizeInBits == 128 && p->bIsExport == CK_FALSE);
+		REQ(mem_is(p->RandomInfo.pClientRandom, "clientRn", 8) && mem_is(p->RandomInfo.pServerRandom, "serverRn", 8));
+		REQ(p->pReturnedKeyMaterial && p->pReturnedKeyMaterial->pIVClient && p->pReturnedKeyMaterial->pIVServer);
+		p->pReturnedKeyMaterial->hClientMacSecret = 11; p->pReturnedKeyMaterial->hServerMacSecret = 12;
+		p->pReturnedKeyMaterial->hClientKey = 13; p->pReturnedKeyMaterial->hServerKey = 14;
+		for (i = 0; i < 16; i++) { p->pReturnedKeyMaterial->pIVClient[i] = (CK_BYTE)(0xC0 + i); p->pReturnedKeyMaterial->pIVServer[i] = (CK_BYTE)(0xD0 + i); }
+		*key = 0;
+		return CKR_OK;
+	}
+	case CKM_TLS_PRF: case CKM_WTLS_PRF: {
+		CK_BYTE_PTR seed, label, out; CK_ULONG sl, ll, *olen;
+		if (m->mechanism == CKM_TLS_PRF) {
+			CK_TLS_PRF_PARAMS *p = m->pParameter;
+			REQ(p && m->ulParameterLen == sizeof *p);
+			seed = p->pSeed; sl = p->ulSeedLen; label = p->pLabel; ll = p->ulLabelLen; out = p->pOutput; olen = p->pulOutputLen;
+		} else {
+			CK_WTLS_PRF_PARAMS *p = m->pParameter;
+			REQ(p && m->ulParameterLen == sizeof *p && p->DigestMechanism == CKM_SHA_1);
+			seed = p->pSeed; sl = p->ulSeedLen; label = p->pLabel; ll = p->ulLabelLen; out = p->pOutput; olen = p->pulOutputLen;
+		}
+		REQ(sl == 4 && mem_is(seed, "seed", 4) && ll == 5 && mem_is(label, "label", 5));
+		REQ(out && olen && *olen == 48);	/* the room the caller gave */
+		for (i = 0; i < 40; i++) out[i] = (CK_BYTE)(i * 7);
+		*olen = 40;
+		*key = 0;
+		return CKR_OK;
+	}
+	case CKM_WTLS_MASTER_KEY_DERIVE: {
+		CK_WTLS_MASTER_KEY_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->DigestMechanism == CKM_SHA_1 && mem_is(p->RandomInfo.pClientRandom, "clientRn", 8));
+		REQ(p->pVersion && *p->pVersion == 1);
+		*p->pVersion = 2;
+		*key = 0x103;
+		return CKR_OK;
+	}
+	case CKM_WTLS_SERVER_KEY_AND_MAC_DERIVE: {
+		CK_WTLS_KEY_MAT_PARAMS *p = m->pParameter;
+		REQ(p && p->DigestMechanism == CKM_SHA_1 && p->ulMacSizeInBits == 160 && p->ulKeySizeInBits == 128);
+		REQ(p->ulIVSizeInBits == 64 && p->ulSequenceNumber == 9 && p->bIsExport == CK_TRUE);
+		REQ(p->pReturnedKeyMaterial && p->pReturnedKeyMaterial->pIV);
+		p->pReturnedKeyMaterial->hMacSecret = 21; p->pReturnedKeyMaterial->hKey = 22;
+		for (i = 0; i < 8; i++) p->pReturnedKeyMaterial->pIV[i] = (CK_BYTE)(0xE0 + i);
+		*key = 0;
+		return CKR_OK;
+	}
+	case CKM_TLS12_KDF: {
+		CK_TLS_KDF_PARAMS *p = m->pParameter;
+		REQ(p && p->prfMechanism == CKM_SHA256 && p->ulLabelLength == 13 && mem_is(p->pLabel, "master secret", 13));
+		REQ(mem_is(p->RandomInfo.pClientRandom, "clientRn", 8) && mem_is(p->RandomInfo.pServerRandom, "serverRn", 8));
+		REQ(p->ulContextDataLength == 3 && mem_is(p->pContextData, "ctx", 3));
+		return CKR_OK;
+	}
+
+	/* ---- password based ---- */
+	case CKM_PKCS5_PBKD2: {
+		/* an application built for the old header passes a pointer to the length */
+		CK_PKCS5_PBKD2_PARAMS2 *p = m->pParameter;
+		int ptr_form;
+		CK_ULONG plen;
+		REQ(p && m->ulParameterLen == sizeof *p);
+		ptr_form = p->ulPasswordLen > 4096;
+		plen = ptr_form ? *(CK_ULONG *)(uintptr_t)p->ulPasswordLen : p->ulPasswordLen;
+		REQ(p->saltSource == CKZ_SALT_SPECIFIED && p->ulSaltSourceDataLen == 8 && mem_is(p->pSaltSourceData, "saltsalt", 8));
+		REQ(p->iterations == 1000 && p->prf == CKP_PKCS5_PBKD2_HMAC_SHA256 && p->ulPrfDataLen == 0);
+		REQ(plen == 7 && mem_is(p->pPassword, "hunter2", 7));
+		*key = ptr_form ? 0x201 : 0x202;
+		return CKR_OK;
+	}
+	case CKM_SP800_108_COUNTER_KDF: {
+		CK_SP800_108_KDF_PARAMS *p = m->pParameter;
+		CK_SP800_108_COUNTER_FORMAT *cf;
+		REQ(p && m->ulParameterLen == sizeof *p && p->prfType == CKM_SHA256_HMAC && p->ulNumberOfDataParams == 3);
+		REQ(p->pDataParams[0].type == CK_SP800_108_ITERATION_VARIABLE && p->pDataParams[0].ulValueLen == sizeof *cf);
+		cf = p->pDataParams[0].pValue;
+		REQ(cf && cf->bLittleEndian == CK_FALSE && cf->ulWidthInBits == 16);
+		REQ(p->pDataParams[1].type == CK_SP800_108_BYTE_ARRAY && p->pDataParams[1].ulValueLen == 5 && mem_is(p->pDataParams[1].pValue, "label", 5));
+		REQ(p->pDataParams[2].type == CK_SP800_108_DKM_LENGTH);
+		REQ(p->ulAdditionalDerivedKeys == 2 && p->pAdditionalDerivedKeys);
+		REQ(p->pAdditionalDerivedKeys[0].ulAttributeCount == 1 && p->pAdditionalDerivedKeys[0].pTemplate[0].type == CKA_LABEL &&
+		    p->pAdditionalDerivedKeys[0].pTemplate[0].ulValueLen == 2 && mem_is(p->pAdditionalDerivedKeys[0].pTemplate[0].pValue, "k1", 2));
+		REQ(p->pAdditionalDerivedKeys[1].ulAttributeCount == 1 && mem_is(p->pAdditionalDerivedKeys[1].pTemplate[0].pValue, "k2", 2));
+		REQ(p->pAdditionalDerivedKeys[0].phKey && p->pAdditionalDerivedKeys[1].phKey);
+		*p->pAdditionalDerivedKeys[0].phKey = 0x301; *p->pAdditionalDerivedKeys[1].phKey = 0x302;
+		*key = 0x300;
+		return CKR_OK;
+	}
+	case CKM_SP800_108_FEEDBACK_KDF: {
+		CK_SP800_108_FEEDBACK_KDF_PARAMS *p = m->pParameter;
+		REQ(p && p->prfType == CKM_SHA256_HMAC && p->ulNumberOfDataParams == 1 && p->pDataParams[0].type == CK_SP800_108_BYTE_ARRAY);
+		REQ(p->ulIVLen == 8 && mem_is(p->pIV, "feedback", 8));
+		REQ(p->ulAdditionalDerivedKeys == 1 && p->pAdditionalDerivedKeys[0].phKey && p->pAdditionalDerivedKeys[0].ulAttributeCount == 0);
+		*p->pAdditionalDerivedKeys[0].phKey = 0x311;
+		*key = 0x310;
+		return CKR_OK;
+	}
+
+	/* ---- IKE ---- */
+	case CKM_IKE2_PRF_PLUS_DERIVE: {
+		CK_IKE2_PRF_PLUS_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->prfMechanism == CKM_SHA256_HMAC && p->bHasSeedKey == CK_TRUE && p->hSeedKey == 77 && p->ulSeedDataLen == 4 && mem_is(p->pSeedData, "seed", 4));
+		return CKR_OK;
+	}
+	case CKM_IKE_PRF_DERIVE: {
+		CK_IKE_PRF_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->bDataAsKey == CK_TRUE && p->bRekey == CK_FALSE && p->ulNiLen == 8 && mem_is(p->pNi, "Ni-nonce", 8));
+		REQ(p->ulNrLen == 9 && mem_is(p->pNr, "Nr-nonce!", 9) && p->hNewKey == 88);
+		return CKR_OK;
+	}
+	case CKM_IKE1_PRF_DERIVE: {
+		CK_IKE1_PRF_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->bHasPrevKey == CK_TRUE && p->hKeygxy == 5 && p->hPrevKey == 6 && p->keyNumber == 3);
+		REQ(p->ulCKYiLen == 8 && mem_is(p->pCKYi, "CKYi-cky", 8) && p->ulCKYrLen == 8 && mem_is(p->pCKYr, "CKYr-cky", 8));
+		return CKR_OK;
+	}
+	case CKM_IKE1_EXTENDED_DERIVE: {
+		CK_IKE1_EXTENDED_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->bHasKeygxy == CK_TRUE && p->hKeygxy == 9 && p->ulExtraDataLen == 5 && mem_is(p->pExtraData, "extra", 5));
+		return CKR_OK;
+	}
+
+	/* ---- other key agreement ---- */
+	case CKM_X9_42_DH_DERIVE: {
+		CK_X9_42_DH1_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->kdf == 2 && p->ulOtherInfoLen == 5 && mem_is(p->pOtherInfo, "other", 5) && p->ulPublicDataLen == 8 && mem_is(p->pPublicData, "pubvalue", 8));
+		return CKR_OK;
+	}
+	case CKM_X9_42_MQV_DERIVE: {
+		CK_X9_42_MQV_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->kdf == 2 && mem_is(p->pOtherInfo, "other", 5) && mem_is(p->pPublicData, "pubvalue", 8));
+		REQ(p->ulPrivateDataLen == 3 && p->hPrivateData == 55 && p->ulPublicDataLen2 == 6 && mem_is(p->pPublicData2, "public", 6) && p->publicKey == 66);
+		return CKR_OK;
+	}
+	case CKM_KEA_DERIVE: {
+		CK_KEA_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->isSender == CK_TRUE && p->ulRandomLen == 4 && mem_is(p->pRandomA, "AAAA", 4) && mem_is(p->pRandomB, "BBBB", 4));
+		REQ(p->ulPublicDataLen == 6 && mem_is(p->pPublicData, "public", 6));
+		return CKR_OK;
+	}
+	case CKM_GOSTR3410_DERIVE: {
+		CK_GOSTR3410_DERIVE_PARAMS *p = m->pParameter;
+		REQ(p && p->kdf == 3 && p->ulPublicDataLen == 6 && mem_is(p->pPublicData, "public", 6) && p->ulUKMLen == 8 && mem_is(p->pUKM, "ukm-ukm!", 8));
+		return CKR_OK;
+	}
+	default:
+		return CKR_MECHANISM_INVALID;
+	}
+}
+
+
+static CK_RV m_GenerateKey(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_ATTRIBUTE_PTR t, CK_ULONG n, CK_OBJECT_HANDLE_PTR key)
+{
+	CK_ULONG i;
+	*key = 0x400;
+	switch (m->mechanism) {
+	case CKM_PBE_SHA1_DES3_EDE_CBC: {
+		CK_PBE_PARAMS *p = m->pParameter;
+		REQ(p && m->ulParameterLen == sizeof *p && p->pInitVector);
+		REQ(p->ulPasswordLen == 6 && mem_is(p->pPassword, "secret", 6) && p->ulSaltLen == 4 && mem_is(p->pSalt, "salt", 4) && p->ulIteration == 2048);
+		for (i = 0; i < 8; i++) p->pInitVector[i] = (CK_BYTE)(0x90 + i);	/* the IV the token derived */
+		return CKR_OK;
+	}
+	case CKM_PBE_SHA1_RC4_128: {
+		CK_PBE_PARAMS *p = m->pParameter;
+		REQ(p && p->pInitVector == NULL);	/* a stream cipher has no IV */
+		REQ(p->ulPasswordLen == 6 && p->ulSaltLen == 4);
+		return CKR_OK;
+	}
+	case CKM_DSA_PROBABILISTIC_PARAMETER_GEN: {
+		CK_DSA_PARAMETER_GEN_PARAM *p = m->pParameter;
+		if (!p) return CKR_OK;			/* the parameter is optional */
+		REQ(m->ulParameterLen == sizeof *p && p->hash == CKM_SHA256 && p->ulSeedLen == 16 && p->ulIndex == 5);
+		for (i = 0; i < 16; i++) REQ(p->pSeed[i] == (CK_BYTE)(i + 1));
+		return CKR_OK;
+	}
 	default:
 		return CKR_MECHANISM_INVALID;
 	}
@@ -135,6 +345,49 @@ static CK_RV m_SignInit(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HANDL
 	}
 	case CKM_SHA256_HMAC_GENERAL:
 		return m->pParameter && m->ulParameterLen == sizeof(CK_ULONG) && *(CK_ULONG *)m->pParameter == 16 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	case CKM_TLS12_MAC: {
+		CK_TLS_MAC_PARAMS *p = m->pParameter;
+		return p && m->ulParameterLen == sizeof *p && p->prfHashMechanism == CKM_SHA256 && p->ulMacLength == 12 && p->ulServerOrClient == 1 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	}
+	case CKM_TLS10_MAC_SERVER: case CKM_SHA512_T:
+		return m->pParameter && m->ulParameterLen == sizeof(CK_ULONG) && *(CK_ULONG *)m->pParameter == 224 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	case CKM_XEDDSA: {
+		CK_XEDDSA_PARAMS *p = m->pParameter;
+		return p && m->ulParameterLen == sizeof *p && p->hash == 4 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	}
+	case CKM_AES_XTS:
+		return m->ulParameterLen == 16 && mem_is(m->pParameter, "0123456789abcdef", 16) ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	case CKM_RC5_MAC_GENERAL: {
+		CK_RC5_MAC_GENERAL_PARAMS *p = m->pParameter;
+		return p && m->ulParameterLen == sizeof *p && p->ulWordsize == 32 && p->ulRounds == 12 && p->ulMacLength == 8 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	}
+	case CKM_RC5_CBC: {
+		CK_RC5_CBC_PARAMS *p = m->pParameter;
+		return p && p->ulWordsize == 32 && p->ulRounds == 12 && p->ulIvLen == 8 && mem_is(p->pIv, "rc5-iv!!", 8) ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	}
+	case CKM_KEY_WRAP_SET_OAEP: {
+		CK_KEY_WRAP_SET_OAEP_PARAMS *p = m->pParameter;
+		return p && p->bBC == 1 && p->ulXLen == 5 && mem_is(p->pX, "xdata", 5) ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	}
+	case CKM_SECURID: {
+		CK_OTP_PARAMS *p = m->pParameter;
+		REQ(p && m->ulParameterLen == sizeof *p && p->ulCount == 2);
+		REQ(p->pParams[0].type == CK_OTP_PIN && p->pParams[0].ulValueLen == 4 && mem_is(p->pParams[0].pValue, "1234", 4));
+		REQ(p->pParams[1].type == CK_OTP_TIME && p->pParams[1].ulValueLen == 6 && mem_is(p->pParams[1].pValue, "123456", 6));
+		return CKR_OK;
+	}
+	case CKM_CMS_SIG: {
+		CK_CMS_SIG_PARAMS *p = m->pParameter;
+		CK_RSA_PKCS_PSS_PARAMS *pss;
+		REQ(p && m->ulParameterLen == sizeof *p && p->certificateHandle == 44);
+		REQ(p->pSigningMechanism && p->pSigningMechanism->mechanism == CKM_SHA256_RSA_PKCS_PSS && p->pSigningMechanism->ulParameterLen == sizeof *pss);
+		pss = p->pSigningMechanism->pParameter;
+		REQ(pss && pss->hashAlg == CKM_SHA256 && pss->mgf == CKG_MGF1_SHA256 && pss->sLen == 32);
+		REQ(p->pDigestMechanism && p->pDigestMechanism->mechanism == CKM_SHA256 && p->pDigestMechanism->pParameter == NULL);
+		REQ(p->pContentType && strcmp((char *)p->pContentType, "1.2.840.113549.1.7.1") == 0);
+		REQ(p->ulRequestedAttributesLen == 3 && mem_is(p->pRequestedAttributes, "req", 3) && p->ulRequiredAttributesLen == 2 && mem_is(p->pRequiredAttributes, "rq", 2));
+		return CKR_OK;
+	}
 	case CKM_ECDSA_SHA256: case CKM_ECDSA_SHA3_256: case CKM_DSA_SHA512:
 		return m->pParameter == NULL && m->ulParameterLen == 0 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
 	default:
@@ -152,6 +405,17 @@ static CK_RV m_WrapKey(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HANDLE
 		if (o->ulSourceDataLen != 3 || !o->pSourceData || memcmp(o->pSourceData, "lbl", 3)) return CKR_MECHANISM_PARAM_INVALID;
 		if (out && *ol >= 4) { memcpy(out, "WRAP", 4); }
 		*ol = 4;
+		return CKR_OK;
+	}
+	if (m->mechanism == CKM_KIP_WRAP) {
+		CK_KIP_PARAMS *p = m->pParameter;
+		CK_ECDH1_DERIVE_PARAMS *e;
+		if (!p || m->ulParameterLen != sizeof *p || p->hKey != 33 || p->ulSeedLen != 4 || !mem_is(p->pSeed, "seed", 4)) return CKR_MECHANISM_PARAM_INVALID;
+		/* a mechanism with a parameter that itself points at data */
+		if (!p->pMechanism || p->pMechanism->mechanism != CKM_ECDH1_DERIVE) return CKR_MECHANISM_PARAM_INVALID;
+		e = p->pMechanism->pParameter;
+		if (!e || e->ulPublicDataLen != 4 || !mem_is(e->pPublicData, "abcd", 4)) return CKR_MECHANISM_PARAM_INVALID;
+		*ol = 0;
 		return CKR_OK;
 	}
 	if (m->mechanism == CKM_ECDH_AES_KEY_WRAP) {
@@ -329,7 +593,7 @@ static CK_FUNCTION_LIST list2 = {
 	.C_GetSlotList = m_GetSlotList,
 	.C_OpenSession = m_OpenSession, .C_CloseSession = m_CloseSession,
 	.C_EncryptInit = m_EncryptInit,
-	.C_DeriveKey = m_DeriveKey, .C_SignInit = m_SignInit, .C_WrapKey = m_WrapKey,
+	.C_DeriveKey = m_DeriveKey, .C_GenerateKey = m_GenerateKey, .C_SignInit = m_SignInit, .C_WrapKey = m_WrapKey,
 };
 
 EXPORT CK_RV C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR l) { *l = &list2; return CKR_OK; }

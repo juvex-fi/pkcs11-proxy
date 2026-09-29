@@ -130,7 +130,7 @@ int main(int argc, char **argv)
 
 	/* mechanisms the proxy doesn't handle are refused, not forwarded */
 	{
-		CK_MECHANISM m = { CKM_TLS12_MASTER_KEY_DERIVE, "x", 1 };
+		CK_MECHANISM m = { CKM_X3DH_INITIALIZE, "x", 1 };
 		RV("unsupported mechanism", f->C_SignInit(s, &m, 1), CKR_MECHANISM_INVALID);
 	}
 

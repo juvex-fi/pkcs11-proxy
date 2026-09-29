@@ -95,20 +95,8 @@ typedef struct _CallState {
 	 */
 	SessionState sessions[PKCS11PROXY_MAX_SESSION_COUNT];
 	GckRpcTlsPskState *tls;
-	/* Aligned copy of a flat (pointer-free) mechanism parameter */
-	union {
-		CK_ULONG align;
-		unsigned char raw[64];
-	} mech_flat;
-#ifdef CKM_ML_DSA
-	/* Backing store for a deserialized mechanism additional-context */
-	union {
-		CK_SIGN_ADDITIONAL_CONTEXT sign;
-		CK_HASH_SIGN_ADDITIONAL_CONTEXT hash_sign;
-	} mech_ctx;
-	/* Backing store for a deserialized AEAD mechanism parameter */
+	/* The rebuilt mechanism parameter, and what to send back of it */
 	GckRpcParamState mech_param;
-#endif
 } CallState;
 
 typedef struct _DispatchState {
@@ -803,108 +791,14 @@ static CK_RV proto_read_mechanism(CallState * cs, CK_MECHANISM_PTR mech)
 	    (&msg->buffer, msg->parsed, &msg->parsed, &data, &n_data))
 		return PARSE_ERROR;
 
-	mech->mechanism = value;
-	mech->pParameter = (CK_VOID_PTR) data;
-	mech->ulParameterLen = n_data;
-
 	/*
-	 * The daemon is the trust boundary: it must not rely on the client
-	 * library having filtered mechanisms or parameters. Only mechanisms
-	 * whose parameter we know how to handle safely get through; the
-	 * parameter is never passed on as the client's raw bytes unless it is
-	 * a flat structure of the exact expected size.
+	 * The daemon is the trust boundary: only mechanisms whose parameter we
+	 * can rebuild safely get through, and never with the client's pointers
+	 * (see gck-rpc-params.c). The rebuilt structure stays in cs->mech_param
+	 * so that what the module writes into it can be returned.
 	 */
-	if (!gck_rpc_mechanism_is_supported(value))
-		return CKR_MECHANISM_INVALID;
-	if (gck_rpc_mechanism_has_no_parameters(value)) {
-		mech->pParameter = NULL;
-		mech->ulParameterLen = 0;
-		return CKR_OK;
-	}
-	if (gck_rpc_mechanism_has_sane_parameters(value)) {
-		if (!gck_rpc_mechanism_flat_param_len_ok(value, n_data))
-			return CKR_MECHANISM_PARAM_INVALID;
-		if (n_data == 0) {
-			mech->pParameter = NULL;
-			mech->ulParameterLen = 0;
-		} else {
-			/* aligned, private copy */
-			void *copy = n_data <= sizeof(cs->mech_flat) ?
-				     (void *)&cs->mech_flat : call_alloc(cs, n_data);
-
-			if (copy == NULL)
-				return CKR_DEVICE_MEMORY;
-			memcpy(copy, data, n_data);
-			mech->pParameter = copy;
-		}
-		return CKR_OK;
-	}
-
-#ifdef CKM_ML_DSA
-	{
-		int kind = gck_rpc_mechanism_context_kind(value);
-		if (kind) {
-			/* Rebuild the additional-context struct locally; the
-			 * client's pointers are meaningless here. */
-			size_t hdr = (kind == GCK_RPC_CONTEXT_HASH_SIGN) ? 16 : 8;
-			const unsigned char *p = data;
-			uint64_t hedge = 0, hash = 0;
-			size_t i, ctx_len;
-
-			if (n_data == 0) {
-				mech->pParameter = NULL;
-				mech->ulParameterLen = 0;
-				return CKR_OK;
-			}
-			if (n_data < hdr || n_data - hdr > GCK_RPC_CONTEXT_MAX_LEN)
-				return CKR_MECHANISM_PARAM_INVALID;
-			ctx_len = n_data - hdr;
-			for (i = 0; i < 8; ++i)
-				hedge = (hedge << 8) | p[i];
-			if (kind == GCK_RPC_CONTEXT_HASH_SIGN)
-				for (i = 8; i < 16; ++i)
-					hash = (hash << 8) | p[i];
-
-			if (kind == GCK_RPC_CONTEXT_HASH_SIGN) {
-				cs->mech_ctx.hash_sign.hedgeVariant = hedge;
-				cs->mech_ctx.hash_sign.pContext =
-					ctx_len ? (CK_BYTE_PTR)(p + hdr) : NULL;
-				cs->mech_ctx.hash_sign.ulContextLen = ctx_len;
-				cs->mech_ctx.hash_sign.hash = hash;
-				mech->pParameter = &cs->mech_ctx.hash_sign;
-				mech->ulParameterLen = sizeof(cs->mech_ctx.hash_sign);
-			} else {
-				cs->mech_ctx.sign.hedgeVariant = hedge;
-				cs->mech_ctx.sign.pContext =
-					ctx_len ? (CK_BYTE_PTR)(p + hdr) : NULL;
-				cs->mech_ctx.sign.ulContextLen = ctx_len;
-				mech->pParameter = &cs->mech_ctx.sign;
-				mech->ulParameterLen = sizeof(cs->mech_ctx.sign);
-			}
-		}
-	}
-	{
-		const GckRpcParamDesc *d = gck_rpc_param_desc_for_mechanism(value);
-		if (d) {
-			CK_RV rv;
-
-			if (n_data == 0) {
-				mech->pParameter = NULL;
-				mech->ulParameterLen = 0;
-				return CKR_OK;
-			}
-			rv = gck_rpc_param_decode(data, n_data, GCK_RPC_PHASE_MECH,
-						  &cs->mech_param, call_alloc_cb, cs);
-			if (rv != CKR_OK)
-				return rv;
-			if (cs->mech_param.desc != d)
-				return CKR_MECHANISM_PARAM_INVALID;
-			mech->pParameter = &cs->mech_param.s;
-			mech->ulParameterLen = d->size;
-		}
-	}
-#endif
-	return CKR_OK;
+	return gck_rpc_mech_param_decode(value, data, data ? n_data : 0,
+					 call_alloc_cb, cs, mech, &cs->mech_param);
 }
 
 static CK_RV proto_write_info(CallState * cs, CK_INFO_PTR info)
@@ -1105,6 +999,18 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
 			_ret = PREP_ERROR; \
 	}
 #endif
+
+/* Return what the module wrote into the mechanism parameter (see
+ * gck-rpc-params.c); empty for mechanisms that return nothing this way. */
+#define OUT_MECH_OUTPUT() \
+	if (_ret == CKR_OK) { \
+		unsigned char *_mo = NULL; \
+		size_t _mn = 0; \
+		if (gck_rpc_param_resp_encode_alloc (&cs->mech_param, &_mo, &_mn) != CKR_OK || \
+		    !gck_rpc_message_write_byte_array (cs->resp, _mo ? _mo : (unsigned char *)"", _mn)) \
+			_ret = PREP_ERROR; \
+		free (_mo); \
+	}
 
 #define IN_MECHANISM(mech) \
 	_ret = proto_read_mechanism (cs, &mech); \
@@ -2174,6 +2080,7 @@ static CK_RV rpc_C_GenerateKey(CallState * cs)
 	IN_ATTRIBUTE_ARRAY(template, count);
 	PROCESS_CALL((session, &mechanism, template, count, &key));
 	OUT_ULONG(key);
+	OUT_MECH_OUTPUT();
 	END_CALL;
 }
 
@@ -2263,6 +2170,7 @@ static CK_RV rpc_C_DeriveKey(CallState * cs)
 	PROCESS_CALL((session, &mechanism, base_key, template, attribute_count,
 		      &key));
 	OUT_ULONG(key);
+	OUT_MECH_OUTPUT();
 	END_CALL;
 }
 

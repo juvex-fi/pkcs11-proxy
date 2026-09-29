@@ -65,7 +65,7 @@ static void test_mechanisms(void)
 	memset(raw, 0x41, sizeof raw);
 
 	/* a mechanism the proxy doesn't handle: refused whatever it carries */
-	fresh(); add_mechanism(CKM_TLS12_MASTER_KEY_DERIVE, raw, 40);
+	fresh(); add_mechanism(CKM_X3DH_INITIALIZE, raw, 40);
 	CHECK(read_mech(&m) == CKR_MECHANISM_INVALID, "unsupported mechanism must be refused");
 	fresh(); add_mechanism(0x7fffff01UL, raw, 8);
 	CHECK(read_mech(&m) == CKR_MECHANISM_INVALID, "unknown mechanism must be refused");
@@ -191,6 +191,109 @@ static void test_mechanisms(void)
 		fresh(); add_mechanism(CKM_RSA_AES_KEY_WRAP, blob, 1 + 8 + 1);
 		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "nested structure announced but missing");
 	}
+	/* structures that return values or hold pointers to lengths and arrays:
+	 * the client's raw bytes are never accepted, whatever they contain */
+	{
+		static const CK_MECHANISM_TYPE mechs[] = {
+			CKM_TLS_PRF, CKM_WTLS_PRF, CKM_TLS_MASTER_KEY_DERIVE, CKM_TLS12_MASTER_KEY_DERIVE,
+			CKM_TLS12_KEY_AND_MAC_DERIVE, CKM_WTLS_SERVER_KEY_AND_MAC_DERIVE, CKM_PKCS5_PBKD2,
+			CKM_PBE_SHA1_DES3_EDE_CBC, CKM_SP800_108_COUNTER_KDF, CKM_SP800_108_FEEDBACK_KDF,
+			CKM_CMS_SIG, CKM_KIP_WRAP, CKM_SECURID, CKM_IKE_PRF_DERIVE, CKM_X9_42_MQV_DERIVE,
+			CKM_TLS12_KDF, CKM_GOSTR3410_DERIVE, CKM_KEA_DERIVE, CKM_RC5_CBC,
+		};
+		for (size_t i = 0; i < sizeof mechs / sizeof mechs[0]; i++) {
+			unsigned char forged[192];
+			memset(forged, 0x41, sizeof forged);	/* pointers 0x4141414141414141 */
+			fresh(); add_mechanism(mechs[i], forged, 72);
+			rv = read_mech(&m);
+			CHECK(rv == CKR_MECHANISM_PARAM_INVALID, "raw parameter refused for mechanism 0x%lx (got 0x%lx)",
+			      (unsigned long)mechs[i], (unsigned long)rv);
+			memset(forged, 0, sizeof forged);
+			fresh(); add_mechanism(mechs[i], forged, 72);
+			CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "all-zero raw parameter refused for mechanism 0x%lx", (unsigned long)mechs[i]);
+		}
+	}
+	/* output buffers: the capacity the client claims is bounded */
+	{
+		unsigned char out[64], blob[600]; size_t n;
+		CK_BYTE b[8] = { 0 };
+		CK_ULONG cap = 100;
+		CK_TLS_PRF_PARAMS p = { b, 4, b, 4, out, &cap };
+		CK_TLS_PRF_PARAMS *got;
+
+		CHECK(gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_TLS_PRF), &p, GCK_RPC_PHASE_MECH, blob, sizeof blob, &n) == CKR_OK,
+		      "encode TLS_PRF");
+		fresh(); add_mechanism(CKM_TLS_PRF, blob, n);
+		rv = read_mech(&m);
+		got = m.pParameter;
+		CHECK(rv == CKR_OK && got && got->pOutput && got->pulOutputLen && *got->pulOutputLen == 100 &&
+		      got->pOutput != out && got->pulOutputLen != &cap, "PRF output buffer and length rebuilt in daemon memory");
+		if (rv == CKR_OK && got && got->pOutput) memset(got->pOutput, 0x55, *got->pulOutputLen);	/* writable to its capacity */
+		/* a capacity the client can't have room for */
+		cap = (CK_ULONG)1 << 30;
+		CHECK(gck_rpc_param_encode_alloc(gck_rpc_param_desc_for_mechanism(CKM_TLS_PRF), &p, GCK_RPC_PHASE_MECH, (unsigned char **)&got, &n) != CKR_OK,
+		      "the client won't encode a 1 GiB output buffer");
+		/* ... and one forged straight into a blob */
+		cap = 100;
+		gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_TLS_PRF), &p, GCK_RPC_PHASE_MECH, blob, sizeof blob, &n);
+		{
+			/* the CK_ULONGs come first: seed len, label len (2 x 8 bytes); the length pointer's value follows */
+			size_t off = 1 + 8 + 8 + 1;	/* kind, ulSeedLen, ulLabelLen, presence of pulOutputLen */
+			for (int i = 0; i < 8; i++) blob[off + i] = (i == 4) ? 0x40 : 0;	/* 0x40 << 24 = 1 GiB */
+			fresh(); add_mechanism(CKM_TLS_PRF, blob, n);
+			CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "a forged 1 GiB output capacity is refused");
+		}
+	}
+	/* presence bytes, array counts and nesting depth */
+	{
+		unsigned char blob[64];
+		size_t n = 0;
+		const GckRpcParamDesc *kip = gck_rpc_param_desc_for_mechanism(CKM_KIP_WRAP);
+		unsigned char lvl[4][200]; size_t ln[4];
+
+		/* a KIP structure whose pMechanism is absent; wrap it in itself */
+		memset(lvl, 0, sizeof lvl);
+		lvl[0][0] = (unsigned char)kip->kind;	/* hKey, ulSeedLen: 16 zero bytes; presence 0 */
+		ln[0] = 1 + 16 + 1;
+		for (int i = 1; i < 4; i++) {
+			size_t o = 0;
+			lvl[i][o++] = (unsigned char)kip->kind;
+			o += 16;
+			lvl[i][o++] = 1;				/* a mechanism follows */
+			for (int k = 0; k < 8; k++) lvl[i][o++] = (k == 7) ? (CKM_KIP_WRAP & 0xff) : (unsigned char)((CKM_KIP_WRAP >> (8 * (7 - k))) & 0xff);
+			lvl[i][o++] = 0; lvl[i][o++] = 0; lvl[i][o++] = (unsigned char)(ln[i - 1] >> 8); lvl[i][o++] = (unsigned char)ln[i - 1];
+			memcpy(lvl[i] + o, lvl[i - 1], ln[i - 1]);
+			ln[i] = o + ln[i - 1];
+		}
+		fresh(); add_mechanism(CKM_KIP_WRAP, lvl[0], ln[0]);
+		CHECK(read_mech(&m) == CKR_OK, "a KIP parameter without a nested mechanism");
+		fresh(); add_mechanism(CKM_KIP_WRAP, lvl[2], ln[2]);
+		CHECK(read_mech(&m) == CKR_OK, "two levels of nested mechanisms");
+		fresh(); add_mechanism(CKM_KIP_WRAP, lvl[3], ln[3]);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "mechanisms nested too deeply are refused");
+
+		/* a presence byte that is neither 0 nor 1 */
+		memcpy(blob, lvl[0], ln[0]);
+		blob[ln[0] - 1] = 2;
+		n = ln[0];
+		fresh(); add_mechanism(CKM_KIP_WRAP, blob, n);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "presence byte 2 refused");
+	}
+	{
+		/* SP 800-108: an array count no client has a reason to send */
+		unsigned char blob[64];
+		const GckRpcParamDesc *sp = gck_rpc_param_desc_for_mechanism(CKM_SP800_108_COUNTER_KDF);
+		memset(blob, 0, sizeof blob);
+		blob[0] = (unsigned char)sp->kind;
+		blob[1 + 8 + 7] = 0xff; blob[1 + 8 + 6] = 0xff;	/* ulNumberOfDataParams = 65535 */
+		fresh(); add_mechanism(CKM_SP800_108_COUNTER_KDF, blob, 1 + 8 * 4);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "65535 data parameters refused");
+	}
+	fresh(); add_mechanism(CKM_TLS12_MAC, raw, sizeof(CK_TLS_MAC_PARAMS));
+	CHECK(read_mech(&m) == CKR_OK, "TLS MAC parameter accepted");
+	fresh(); add_mechanism(CKM_TLS12_MAC, raw, 5);
+	CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "short TLS MAC parameter");
+
 	/* the extended flat families */
 	fresh(); add_mechanism(CKM_SHA256_HMAC_GENERAL, raw, 4);
 	CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "short general-MAC length");

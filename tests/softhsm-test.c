@@ -337,6 +337,141 @@ static void test_ec(void)
 	} else printf("skip: SHA256_HMAC_GENERAL not offered by the module\n");
 }
 
+/* ---- deriving keys from data: structures the proxy now serializes ---- */
+static CK_OBJECT_HANDLE gen_secret(CK_KEY_TYPE kt, CK_ULONG len, CK_RV *rv)
+{
+	CK_OBJECT_CLASS sk = CKO_SECRET_KEY; CK_BBOOL T = CK_TRUE, F = CK_FALSE;
+	CK_ATTRIBUTE t[] = { {CKA_CLASS, &sk, sizeof sk}, {CKA_KEY_TYPE, &kt, sizeof kt}, {CKA_VALUE_LEN, &len, sizeof len},
+			     {CKA_TOKEN, &F, 1}, {CKA_SENSITIVE, &F, 1}, {CKA_EXTRACTABLE, &T, 1}, {CKA_DERIVE, &T, 1},
+			     {CKA_ENCRYPT, &T, 1}, {CKA_DECRYPT, &T, 1} };
+	CK_MECHANISM m = { kt == CKK_AES ? CKM_AES_KEY_GEN : CKM_GENERIC_SECRET_KEY_GEN, NULL, 0 };
+	CK_OBJECT_HANDLE k = 0;
+	*rv = f->C_GenerateKey(s, &m, t, 9, &k);
+	return k;
+}
+
+static CK_OBJECT_HANDLE derive_generic(CK_MECHANISM *m, CK_OBJECT_HANDLE base, CK_ULONG vlen, CK_RV *rv)
+{
+	CK_OBJECT_CLASS sk = CKO_SECRET_KEY; CK_KEY_TYPE gt = CKK_GENERIC_SECRET; CK_BBOOL T = CK_TRUE, F = CK_FALSE;
+	CK_ATTRIBUTE t[] = { {CKA_CLASS, &sk, sizeof sk}, {CKA_KEY_TYPE, &gt, sizeof gt}, {CKA_TOKEN, &F, 1},
+			     {CKA_SENSITIVE, &F, 1}, {CKA_EXTRACTABLE, &T, 1}, {CKA_VALUE_LEN, &vlen, sizeof vlen} };
+	CK_OBJECT_HANDLE k = 0;
+	*rv = f->C_DeriveKey(s, m, base, t, vlen ? 6 : 5, &k);
+	return k;
+}
+
+static CK_ULONG value_of(CK_OBJECT_HANDLE k, CK_BYTE *buf, CK_ULONG cap)
+{
+	CK_ATTRIBUTE g = { CKA_VALUE, buf, cap };
+	return f->C_GetAttributeValue(s, k, &g, 1) == CKR_OK ? g.ulValueLen : (CK_ULONG)-1;
+}
+
+static void test_derive_from_data(void)
+{
+	CK_RV rv;
+	CK_OBJECT_HANDLE base = gen_secret(CKK_AES, 32, &rv), other, d;
+	CK_BYTE bv[64], ov[64], dv[128], ct[128];
+	CK_ULONG bl, ol, dl, cl;
+
+	RV("AES base key", rv, CKR_OK);
+	if (rv != CKR_OK) return;
+	bl = value_of(base, bv, sizeof bv);
+	CHECK(bl == 32, "base key value readable (%lu)", (unsigned long)bl);
+
+	if (have(CKM_CONCATENATE_BASE_AND_DATA)) {
+		CK_KEY_DERIVATION_STRING_DATA p = { (CK_BYTE_PTR)"suffix", 6 };
+		CK_MECHANISM m = { CKM_CONCATENATE_BASE_AND_DATA, &p, sizeof p };
+		d = derive_generic(&m, base, 0, &rv);
+		RV("CONCATENATE_BASE_AND_DATA", rv, CKR_OK);
+		dl = value_of(d, dv, sizeof dv);
+		CHECK(dl == 38 && memcmp(dv, bv, 32) == 0 && memcmp(dv + 32, "suffix", 6) == 0, "derived key is base || data");
+	}
+	if (have(CKM_CONCATENATE_DATA_AND_BASE)) {
+		CK_KEY_DERIVATION_STRING_DATA p = { (CK_BYTE_PTR)"prefix", 6 };
+		CK_MECHANISM m = { CKM_CONCATENATE_DATA_AND_BASE, &p, sizeof p };
+		d = derive_generic(&m, base, 0, &rv);
+		RV("CONCATENATE_DATA_AND_BASE", rv, CKR_OK);
+		dl = value_of(d, dv, sizeof dv);
+		CHECK(dl == 38 && memcmp(dv, "prefix", 6) == 0 && memcmp(dv + 6, bv, 32) == 0, "derived key is data || base");
+	}
+	if (have(CKM_CONCATENATE_BASE_AND_KEY)) {
+		other = gen_secret(CKK_AES, 16, &rv);
+		ol = value_of(other, ov, sizeof ov);
+		CK_OBJECT_HANDLE hk = other;
+		CK_MECHANISM m = { CKM_CONCATENATE_BASE_AND_KEY, &hk, sizeof hk };
+		d = derive_generic(&m, base, 0, &rv);
+		RV("CONCATENATE_BASE_AND_KEY (the parameter is a key handle)", rv, CKR_OK);
+		dl = value_of(d, dv, sizeof dv);
+		CHECK(dl == 32 + ol && memcmp(dv, bv, 32) == 0 && memcmp(dv + 32, ov, ol) == 0, "derived key is base || other key");
+	}
+	if (have(CKM_AES_CBC_ENCRYPT_DATA)) {
+		/* the derived key is the data encrypted with the base key: compare with C_Encrypt */
+		CK_AES_CBC_ENCRYPT_DATA_PARAMS p; CK_BYTE data[32], iv[16];
+		for (int i = 0; i < 32; i++) data[i] = (CK_BYTE)(i * 3);
+		for (int i = 0; i < 16; i++) iv[i] = (CK_BYTE)(0xA0 + i);
+		memcpy(p.iv, iv, 16); p.pData = data; p.length = 32;
+		CK_MECHANISM m = { CKM_AES_CBC_ENCRYPT_DATA, &p, sizeof p };
+		d = derive_generic(&m, base, 32, &rv);
+		RV("AES_CBC_ENCRYPT_DATA (an IV inside the structure, and a pointer)", rv, CKR_OK);
+		dl = value_of(d, dv, sizeof dv);
+		CK_MECHANISM em = { CKM_AES_CBC, iv, 16 };
+		cl = sizeof ct;
+		f->C_EncryptInit(s, &em, base);
+		RV("the same encryption with C_Encrypt", f->C_Encrypt(s, data, 32, ct, &cl), CKR_OK);
+		CHECK(dl == 32 && cl == 32 && memcmp(dv, ct, 32) == 0, "derived key equals AES-CBC(data)");
+	}
+	if (have(CKM_AES_ECB_ENCRYPT_DATA)) {
+		CK_BYTE data[32];
+		for (int i = 0; i < 32; i++) data[i] = (CK_BYTE)(i + 100);
+		CK_KEY_DERIVATION_STRING_DATA p = { data, 32 };
+		CK_MECHANISM m = { CKM_AES_ECB_ENCRYPT_DATA, &p, sizeof p };
+		d = derive_generic(&m, base, 32, &rv);
+		RV("AES_ECB_ENCRYPT_DATA", rv, CKR_OK);
+		dl = value_of(d, dv, sizeof dv);
+		CK_MECHANISM em = { CKM_AES_ECB, NULL, 0 };
+		cl = sizeof ct;
+		f->C_EncryptInit(s, &em, base);
+		f->C_Encrypt(s, data, 32, ct, &cl);
+		CHECK(dl == 32 && cl == 32 && memcmp(dv, ct, 32) == 0, "derived key equals AES-ECB(data)");
+	}
+}
+
+/* RSA-AES key wrap: the parameter points at an OAEP structure */
+static void test_rsa_aes_wrap(void)
+{
+	CK_ULONG bits = 2048; CK_BYTE e[] = {1, 0, 1}; CK_BBOOL T = CK_TRUE, F = CK_FALSE;
+	CK_ATTRIBUTE pt_[] = { {CKA_MODULUS_BITS, &bits, sizeof bits}, {CKA_PUBLIC_EXPONENT, e, 3}, {CKA_WRAP, &T, 1}, {CKA_TOKEN, &F, 1} };
+	CK_ATTRIBUTE vt_[] = { {CKA_UNWRAP, &T, 1}, {CKA_TOKEN, &F, 1} };
+	CK_MECHANISM kg = { CKM_RSA_PKCS_KEY_PAIR_GEN, NULL, 0 };
+	CK_OBJECT_HANDLE pub, prv;
+	CK_RV rv;
+
+	if (!have(CKM_RSA_AES_KEY_WRAP)) { printf("skip: RSA_AES_KEY_WRAP not offered by the module\n"); return; }
+	rv = f->C_GenerateKeyPair(s, &kg, pt_, 4, vt_, 2, &pub, &prv);
+	RV("RSA keygen for wrapping", rv, CKR_OK);
+	if (rv != CKR_OK) return;
+
+	CK_OBJECT_HANDLE target = gen_secret(CKK_AES, 32, &rv), back;
+	CK_BYTE tv[64], bv[64], wrapped[1024];
+	CK_ULONG wl = sizeof wrapped, tl = value_of(target, tv, sizeof tv);
+	CK_RSA_PKCS_OAEP_PARAMS oaep = { CKM_SHA_1, CKG_MGF1_SHA1, CKZ_DATA_SPECIFIED, NULL, 0 };
+	CK_RSA_AES_KEY_WRAP_PARAMS wp = { 256, &oaep };
+	CK_MECHANISM m = { CKM_RSA_AES_KEY_WRAP, &wp, sizeof wp };
+
+	RV("WrapKey (RSA_AES_KEY_WRAP with nested OAEP parameters)", f->C_WrapKey(s, &m, pub, target, wrapped, &wl), CKR_OK);
+	CHECK(wl > 256, "wrapped key is %lu bytes", (unsigned long)wl);
+
+	CK_OBJECT_CLASS sk = CKO_SECRET_KEY; CK_KEY_TYPE kt = CKK_AES;
+	CK_ATTRIBUTE ut[] = { {CKA_CLASS, &sk, sizeof sk}, {CKA_KEY_TYPE, &kt, sizeof kt}, {CKA_TOKEN, &F, 1},
+			      {CKA_SENSITIVE, &F, 1}, {CKA_EXTRACTABLE, &T, 1} };
+	rv = f->C_UnwrapKey(s, &m, prv, wrapped, wl, ut, 5, &back);
+	RV("UnwrapKey", rv, CKR_OK);
+	if (rv == CKR_OK) {
+		CK_ULONG bl = value_of(back, bv, sizeof bv);
+		CHECK(bl == tl && memcmp(bv, tv, tl) == 0, "the unwrapped key equals the original");
+	}
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -356,6 +491,8 @@ int main(int argc, char **argv)
 	test_aes();
 	test_rsa();
 	test_ec();
+	test_derive_from_data();
+	test_rsa_aes_wrap();
 
 	f->C_Finalize(NULL);
 	printf("\n%d failure(s)\n", fails);
