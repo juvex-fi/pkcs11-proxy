@@ -1451,11 +1451,16 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 		}
 
 		/*
-		 * When the CKF_OS_LOCKING_OK flag isn't set return an error.
-		 * We must be able to use our pthread functionality.
+		 * Locking (PKCS#11 C_Initialize): without mutex functions and
+		 * without CKF_OS_LOCKING_OK the application promises not to call
+		 * us from several threads at once, which is fine. If it supplies
+		 * mutex functions and doesn't allow OS locking we would have to use
+		 * them, and we only ever use our own pthread locks.
+		 * (This library never creates threads, so
+		 * CKF_LIBRARY_CANT_CREATE_OS_THREADS needs no handling.)
 		 */
-		if (!(args->flags & CKF_OS_LOCKING_OK)) {
-			warning(("can't do without os locking"));
+		if (args->CreateMutex != NULL && !(args->flags & CKF_OS_LOCKING_OK)) {
+			warning(("can't use the supplied mutex functions"));
 			ret = CKR_CANT_LOCK;
 			goto done;
 		}
@@ -2552,27 +2557,57 @@ rpc_C_GenerateRandom(CK_SESSION_HANDLE session, CK_BYTE_PTR random_data,
 static CK_FUNCTION_LIST_3_2 functionList32;
 static CK_FUNCTION_LIST functionList;
 
+/*
+ * The 3.0 and 3.1 interfaces have the same functions as 3.2 (3.1 added none)
+ * but must announce their own version, so a client asking for an exact
+ * version gets a list saying so. They are copies of the 3.2 list.
+ */
+static CK_FUNCTION_LIST_3_2 functionList31;
+static CK_FUNCTION_LIST_3_2 functionList30;
+static pthread_once_t interfaces_once = PTHREAD_ONCE_INIT;
+
+static CK_INTERFACE interfaces[4] = {
+	{ (CK_UTF8CHAR_PTR)"PKCS 11", &functionList32, 0 },
+	{ (CK_UTF8CHAR_PTR)"PKCS 11", &functionList31, 0 },
+	{ (CK_UTF8CHAR_PTR)"PKCS 11", &functionList30, 0 },
+	{ (CK_UTF8CHAR_PTR)"PKCS 11", &functionList, 0 },
+};
+
+static void interfaces_init(void)
+{
+	functionList31 = functionList32;
+	functionList31.version.major = 3;
+	functionList31.version.minor = 1;
+	functionList30 = functionList32;
+	functionList30.version.major = 3;
+	functionList30.version.minor = 0;
+}
+
+static CK_VERSION interface_version(const CK_INTERFACE * iface)
+{
+	/* every function list starts with its CK_VERSION */
+	return *(const CK_VERSION *) iface->pFunctionList;
+}
+
 static CK_RV rpc_C_GetInterfaceList(CK_INTERFACE_PTR pInterfacesList,
 				     CK_ULONG_PTR pulCount)
 {
+	CK_ULONG i, n = sizeof(interfaces) / sizeof(interfaces[0]);
+
 	return_val_if_fail(pulCount != NULL, CKR_ARGUMENTS_BAD);
+	pthread_once(&interfaces_once, interfaces_init);
 
 	if (pInterfacesList == NULL) {
-		*pulCount = 2;
+		*pulCount = n;
 		return CKR_OK;
 	}
-	if (*pulCount < 2)
+	if (*pulCount < n) {
+		*pulCount = n;
 		return CKR_BUFFER_TOO_SMALL;
-
-	pInterfacesList[0].pInterfaceName = (CK_UTF8CHAR_PTR)"PKCS 11";
-	pInterfacesList[0].pFunctionList = &functionList32;
-	pInterfacesList[0].flags = 0;
-
-	pInterfacesList[1].pInterfaceName = (CK_UTF8CHAR_PTR)"PKCS 11";
-	pInterfacesList[1].pFunctionList = &functionList;
-	pInterfacesList[1].flags = 0;
-
-	*pulCount = 2;
+	}
+	for (i = 0; i < n; ++i)
+		pInterfacesList[i] = interfaces[i];
+	*pulCount = n;
 	return CKR_OK;
 }
 
@@ -2581,47 +2616,30 @@ static CK_RV rpc_C_GetInterface(CK_UTF8CHAR_PTR pInterfaceName,
 				  CK_INTERFACE_PTR_PTR ppInterface,
 				  CK_FLAGS flags)
 {
-	static CK_INTERFACE iface32 = {
-		(CK_UTF8CHAR_PTR)"PKCS 11", NULL, 0
-	};
-	static CK_INTERFACE iface20 = {
-		(CK_UTF8CHAR_PTR)"PKCS 11", NULL, 0
-	};
+	CK_ULONG i;
 
 	return_val_if_fail(ppInterface != NULL, CKR_ARGUMENTS_BAD);
+	pthread_once(&interfaces_once, interfaces_init);
+	*ppInterface = NULL;
 
-	/* Neither interface has any flags set (e.g. CKF_INTERFACE_FORK_SAFE),
-	 * so a request that requires one can't be satisfied. */
-	if (flags != 0)
-		return CKR_ARGUMENTS_BAD;
+	/* No name or version: the newest interface. Otherwise an exact match;
+	 * no interface has any flags set (e.g. CKF_INTERFACE_FORK_SAFE), so a
+	 * request that requires one can't be satisfied. */
+	for (i = 0; i < sizeof(interfaces) / sizeof(interfaces[0]); ++i) {
+		CK_VERSION v = interface_version(&interfaces[i]);
 
-	iface32.pFunctionList = &functionList32;
-	iface20.pFunctionList = &functionList;
-
-	/* Return default (highest) interface if no name/version specified */
-	if (pInterfaceName == NULL) {
-		*ppInterface = &iface32;
+		if (pInterfaceName != NULL &&
+		    strcmp((char *)pInterfaceName, (char *)interfaces[i].pInterfaceName) != 0)
+			continue;
+		if (pVersion != NULL &&
+		    (pVersion->major != v.major || pVersion->minor != v.minor))
+			continue;
+		if ((interfaces[i].flags & flags) != flags)
+			continue;
+		*ppInterface = &interfaces[i];
 		return CKR_OK;
 	}
-
-	if (strcmp((char *)pInterfaceName, "PKCS 11") != 0)
-		return CKR_ARGUMENTS_BAD;
-
-	/* If version requested, match it */
-	if (pVersion != NULL) {
-		if (pVersion->major == 3 && pVersion->minor <= 2) {
-			*ppInterface = &iface32;
-			return CKR_OK;
-		}
-		if (pVersion->major == 2) {
-			*ppInterface = &iface20;
-			return CKR_OK;
-		}
-		return CKR_ARGUMENTS_BAD;
-	}
-
-	*ppInterface = &iface32;
-	return CKR_OK;
+	return CKR_ARGUMENTS_BAD;
 }
 
 #ifdef GCK_RPC_HAVE_V32

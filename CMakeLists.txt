@@ -101,6 +101,10 @@ if (PKCS11_TESTS)
   target_include_directories(pqc-test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(pqc-test ${CMAKE_DL_LIBS})
 
+  add_executable(interface-test ${T}/interface-test.c)
+  target_include_directories(interface-test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(interface-test ${CMAKE_DL_LIBS})
+
   add_executable(softhsm-test ${T}/softhsm-test.c)
   target_include_directories(softhsm-test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(softhsm-test ${CMAKE_DL_LIBS})
@@ -133,6 +137,10 @@ if (PKCS11_TESTS)
     COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
             $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>
             $<TARGET_FILE:message-test>)
+  add_test(NAME interfaces-init
+    COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
+            $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>
+            $<TARGET_FILE:interface-test>)
   if (PKCS11_TEST_SOFTHSM_MODULE AND PKCS11_TEST_SOFTHSM_UTIL)
     add_test(NAME pqc-softhsm
       COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
