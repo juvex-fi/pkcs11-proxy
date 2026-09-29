@@ -73,6 +73,10 @@ static CK_FUNCTION_LIST_3_2_PTR pkcs11_module32 = NULL;
 typedef struct {
 	CK_SESSION_HANDLE id;
 	CK_SLOT_ID slot;
+	/* Kind of message parameter (GckRpcParamDesc.kind) the active
+	 * C_MessageEncryptInit/C_MessageDecryptInit mechanism expects */
+	int msg_enc_kind;
+	int msg_dec_kind;
 } SessionState;
 
 typedef struct _CallState {
@@ -91,6 +95,15 @@ typedef struct _CallState {
 	 */
 	SessionState sessions[PKCS11PROXY_MAX_SESSION_COUNT];
 	GckRpcTlsPskState *tls;
+#ifdef CKM_ML_DSA
+	/* Backing store for a deserialized mechanism additional-context */
+	union {
+		CK_SIGN_ADDITIONAL_CONTEXT sign;
+		CK_HASH_SIGN_ADDITIONAL_CONTEXT hash_sign;
+	} mech_ctx;
+	/* Backing store for a deserialized AEAD mechanism parameter */
+	GckRpcParamState mech_param;
+#endif
 } CallState;
 
 typedef struct _DispatchState {
@@ -617,6 +630,107 @@ static CK_RV proto_read_space_string(CallState * cs, CK_UTF8CHAR_PTR * val, CK_U
 	return CKR_OK;
 }
 
+#ifdef GCK_RPC_HAVE_V32
+static void *param_alloc(void *ctx, size_t n)
+{
+	return call_alloc((CallState *) ctx, n);
+}
+
+/*
+ * Read a serialized message parameter and rebuild the CK_*_MESSAGE_PARAMS
+ * structure with pointers into daemon-owned buffers. An empty parameter
+ * yields NULL/0.
+ */
+static SessionState *find_session(CallState * cs, CK_SESSION_HANDLE session)
+{
+	int i;
+
+	for (i = 0; i < PKCS11PROXY_MAX_SESSION_COUNT; i++)
+		if (cs->sessions[i].id && cs->sessions[i].id == session)
+			return &cs->sessions[i];
+	return NULL;
+}
+
+/* The message parameter kind a mechanism uses (0: none) */
+static int msg_kind_for_mechanism(CK_MECHANISM_TYPE mech)
+{
+	switch (mech) {
+	case CKM_AES_GCM:
+		return 1;
+	case CKM_AES_CCM:
+		return 2;
+	case CKM_CHACHA20_POLY1305:
+	case CKM_SALSA20_POLY1305:
+		return 3;
+	default:
+		return 0;
+	}
+}
+
+static CK_RV proto_read_msg_param(CallState * cs, CK_SESSION_HANDLE session,
+				  int phase, GckRpcParamState * st,
+				  CK_VOID_PTR * param, CK_ULONG * param_len)
+{
+	CK_BYTE_PTR blob;
+	CK_ULONG n;
+	CK_RV rv;
+
+	memset(st, 0, sizeof(*st));
+	*param = NULL;
+	*param_len = 0;
+
+	rv = proto_read_byte_array(cs, &blob, &n);
+	if (rv != CKR_OK)
+		return rv;
+	if (n == 0)
+		return CKR_OK;
+	if (blob == NULL)
+		return CKR_MECHANISM_PARAM_INVALID;
+
+	rv = gck_rpc_param_decode(blob, n, phase, st, param_alloc, cs);
+	if (rv != CKR_OK)
+		return rv;
+
+	/*
+	 * The module reads this as the structure of the mechanism the session
+	 * was initialised with. A blob of another kind would put integers where
+	 * the module expects pointers, so it must match.
+	 */
+	{
+		SessionState *ss = find_session(cs, session);
+		int expected;
+
+		if (ss == NULL)
+			return CKR_SESSION_HANDLE_INVALID;
+		expected = (phase == GCK_RPC_PHASE_ENC) ? ss->msg_enc_kind :
+							  ss->msg_dec_kind;
+		if (expected == 0)
+			return CKR_OPERATION_NOT_INITIALIZED;
+		if (st->desc->kind != expected)
+			return CKR_MECHANISM_PARAM_INVALID;
+	}
+	*param = &st->s;
+	*param_len = st->desc->size;
+	return CKR_OK;
+}
+
+/* Copy a length-delimited name into a NUL-terminated string */
+static CK_UTF8CHAR_PTR proto_cstring(CallState * cs, CK_BYTE_PTR data, CK_ULONG len)
+{
+	char *str;
+
+	if (len > 4096)
+		return NULL;
+	str = call_alloc(cs, len + 1);
+	if (str == NULL)
+		return NULL;
+	if (len)
+		memcpy(str, data, len);
+	str[len] = 0;
+	return (CK_UTF8CHAR_PTR) str;
+}
+#endif
+
 static CK_RV proto_read_mechanism(CallState * cs, CK_MECHANISM_PTR mech)
 {
 	GckRpcMessage *msg;
@@ -645,6 +759,71 @@ static CK_RV proto_read_mechanism(CallState * cs, CK_MECHANISM_PTR mech)
 	mech->mechanism = value;
 	mech->pParameter = (CK_VOID_PTR) data;
 	mech->ulParameterLen = n_data;
+
+#ifdef CKM_ML_DSA
+	{
+		int kind = gck_rpc_mechanism_context_kind(value);
+		if (kind) {
+			/* Rebuild the additional-context struct locally; the
+			 * client's pointers are meaningless here. */
+			size_t hdr = (kind == GCK_RPC_CONTEXT_HASH_SIGN) ? 16 : 8;
+			const unsigned char *p = data;
+			uint64_t hedge = 0, hash = 0;
+			size_t i, ctx_len;
+
+			if (n_data == 0) {
+				mech->pParameter = NULL;
+				mech->ulParameterLen = 0;
+				return CKR_OK;
+			}
+			if (n_data < hdr || n_data - hdr > GCK_RPC_CONTEXT_MAX_LEN)
+				return CKR_MECHANISM_PARAM_INVALID;
+			ctx_len = n_data - hdr;
+			for (i = 0; i < 8; ++i)
+				hedge = (hedge << 8) | p[i];
+			if (kind == GCK_RPC_CONTEXT_HASH_SIGN)
+				for (i = 8; i < 16; ++i)
+					hash = (hash << 8) | p[i];
+
+			if (kind == GCK_RPC_CONTEXT_HASH_SIGN) {
+				cs->mech_ctx.hash_sign.hedgeVariant = hedge;
+				cs->mech_ctx.hash_sign.pContext =
+					ctx_len ? (CK_BYTE_PTR)(p + hdr) : NULL;
+				cs->mech_ctx.hash_sign.ulContextLen = ctx_len;
+				cs->mech_ctx.hash_sign.hash = hash;
+				mech->pParameter = &cs->mech_ctx.hash_sign;
+				mech->ulParameterLen = sizeof(cs->mech_ctx.hash_sign);
+			} else {
+				cs->mech_ctx.sign.hedgeVariant = hedge;
+				cs->mech_ctx.sign.pContext =
+					ctx_len ? (CK_BYTE_PTR)(p + hdr) : NULL;
+				cs->mech_ctx.sign.ulContextLen = ctx_len;
+				mech->pParameter = &cs->mech_ctx.sign;
+				mech->ulParameterLen = sizeof(cs->mech_ctx.sign);
+			}
+		}
+	}
+	{
+		const GckRpcParamDesc *d = gck_rpc_param_desc_for_mechanism(value);
+		if (d) {
+			CK_RV rv;
+
+			if (n_data == 0) {
+				mech->pParameter = NULL;
+				mech->ulParameterLen = 0;
+				return CKR_OK;
+			}
+			rv = gck_rpc_param_decode(data, n_data, GCK_RPC_PHASE_MECH,
+						  &cs->mech_param, param_alloc, cs);
+			if (rv != CKR_OK)
+				return rv;
+			if (cs->mech_param.desc != d)
+				return CKR_MECHANISM_PARAM_INVALID;
+			mech->pParameter = &cs->mech_param.s;
+			mech->ulParameterLen = d->size;
+		}
+	}
+#endif
 	return CKR_OK;
 }
 
@@ -824,6 +1003,28 @@ static CK_RV proto_write_session_info(CallState * cs, CK_SESSION_INFO_PTR info)
 #define IN_ATTRIBUTE_ARRAY(attrs, n_attrs) \
 	_ret = proto_read_attribute_array (cs, &attrs, &n_attrs); \
 	if (_ret != CKR_OK) goto _cleanup;
+
+#ifdef GCK_RPC_HAVE_V32
+#define IN_MSG_PARAM(st, param, plen, phase) \
+	_ret = proto_read_msg_param (cs, session, phase, &st, &param, &plen); \
+	if (_ret != CKR_OK) goto _cleanup;
+
+/* Sign/verify message calls take no parameter */
+#define IN_MSG_PARAM_NONE(param, plen) \
+	IN_BYTE_ARRAY(param, plen); \
+	if (plen != 0) { _ret = CKR_MECHANISM_PARAM_INVALID; goto _cleanup; } \
+	param = NULL;
+
+/* Return generated IV/nonce and tag; sits before the data array. */
+#define OUT_MSG_PARAM(st) \
+	if (_ret == CKR_OK || _ret == CKR_BUFFER_TOO_SMALL) { \
+		unsigned char _rb[GCK_RPC_MSGPARAM_BLOB]; \
+		size_t _rn = 0; \
+		if (gck_rpc_param_resp_encode (&st, _rb, sizeof (_rb), &_rn) != CKR_OK || \
+		    !gck_rpc_message_write_byte_array (cs->resp, _rb, _rn)) \
+			_ret = PREP_ERROR; \
+	}
+#endif
 
 #define IN_MECHANISM(mech) \
 	_ret = proto_read_mechanism (cs, &mech); \
@@ -1098,6 +1299,8 @@ static CK_RV rpc_C_OpenSession(CallState * cs)
 			if (! cs->sessions[i].id) {
 				cs->sessions[i].id = session;
 				cs->sessions[i].slot = slot_id;
+				cs->sessions[i].msg_enc_kind = 0;
+				cs->sessions[i].msg_dec_kind = 0;
 				gck_rpc_log("Session %li stored in position %i", session, i);
 				break;
 			}
@@ -2053,24 +2256,32 @@ static CK_RV rpc_C_MessageEncryptInit(CallState *cs)
 	IN_MECHANISM(mechanism);
 	IN_ULONG(key);
 	PROCESS_CALL((session, &mechanism, key));
+#ifdef GCK_RPC_HAVE_V32
+	if (_ret == CKR_OK) {
+		SessionState *ss = find_session(cs, session);
+		if (ss)
+			ss->msg_enc_kind = msg_kind_for_mechanism(mechanism.mechanism);
+	}
+#endif
 	END_CALL;
 }
 
 static CK_RV rpc_C_EncryptMessage(CallState *cs)
 {
 	CK_SESSION_HANDLE session;
-	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	GckRpcParamState pst; CK_VOID_PTR parameter; CK_ULONG parameter_len;
 	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
 	CK_BYTE_PTR plaintext; CK_ULONG plaintext_len;
 	CK_BYTE_PTR ciphertext;
 	DECLARE_CK_ULONG_PTR(ciphertext_len);
 	BEGIN_CALL_32(C_EncryptMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM(pst, parameter, parameter_len, GCK_RPC_PHASE_ENC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	IN_BYTE_ARRAY(plaintext, plaintext_len);
 	IN_BYTE_BUFFER(ciphertext, ciphertext_len);
 	PROCESS_CALL((session, parameter, parameter_len, associated_data, associated_data_len, plaintext, plaintext_len, ciphertext, ciphertext_len));
+	OUT_MSG_PARAM(pst);
 	OUT_BYTE_ARRAY(ciphertext, ciphertext_len);
 	END_CALL;
 }
@@ -2078,31 +2289,33 @@ static CK_RV rpc_C_EncryptMessage(CallState *cs)
 static CK_RV rpc_C_EncryptMessageBegin(CallState *cs)
 {
 	CK_SESSION_HANDLE session;
-	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	GckRpcParamState pst; CK_VOID_PTR parameter; CK_ULONG parameter_len;
 	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
 	BEGIN_CALL_32(C_EncryptMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM(pst, parameter, parameter_len, GCK_RPC_PHASE_ENC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	PROCESS_CALL((session, parameter, parameter_len, associated_data, associated_data_len));
+	OUT_MSG_PARAM(pst);
 	END_CALL;
 }
 
 static CK_RV rpc_C_EncryptMessageNext(CallState *cs)
 {
 	CK_SESSION_HANDLE session;
-	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	GckRpcParamState pst; CK_VOID_PTR parameter; CK_ULONG parameter_len;
 	CK_BYTE_PTR plaintext_part; CK_ULONG plaintext_part_len;
 	CK_BYTE_PTR ciphertext_part;
 	DECLARE_CK_ULONG_PTR(ciphertext_part_len);
 	CK_FLAGS flags;
 	BEGIN_CALL_32(C_EncryptMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM(pst, parameter, parameter_len, GCK_RPC_PHASE_ENC);
 	IN_BYTE_ARRAY(plaintext_part, plaintext_part_len);
 	IN_BYTE_BUFFER(ciphertext_part, ciphertext_part_len);
 	IN_ULONG(flags);
 	PROCESS_CALL((session, parameter, parameter_len, plaintext_part, plaintext_part_len, ciphertext_part, ciphertext_part_len, flags));
+	OUT_MSG_PARAM(pst);
 	OUT_BYTE_ARRAY(ciphertext_part, ciphertext_part_len);
 	END_CALL;
 }
@@ -2126,20 +2339,27 @@ static CK_RV rpc_C_MessageDecryptInit(CallState *cs)
 	IN_MECHANISM(mechanism);
 	IN_ULONG(key);
 	PROCESS_CALL((session, &mechanism, key));
+#ifdef GCK_RPC_HAVE_V32
+	if (_ret == CKR_OK) {
+		SessionState *ss = find_session(cs, session);
+		if (ss)
+			ss->msg_dec_kind = msg_kind_for_mechanism(mechanism.mechanism);
+	}
+#endif
 	END_CALL;
 }
 
 static CK_RV rpc_C_DecryptMessage(CallState *cs)
 {
 	CK_SESSION_HANDLE session;
-	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	GckRpcParamState pst; CK_VOID_PTR parameter; CK_ULONG parameter_len;
 	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
 	CK_BYTE_PTR ciphertext; CK_ULONG ciphertext_len;
 	CK_BYTE_PTR plaintext;
 	DECLARE_CK_ULONG_PTR(plaintext_len);
 	BEGIN_CALL_32(C_DecryptMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM(pst, parameter, parameter_len, GCK_RPC_PHASE_DEC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	IN_BYTE_ARRAY(ciphertext, ciphertext_len);
 	IN_BYTE_BUFFER(plaintext, plaintext_len);
@@ -2151,11 +2371,11 @@ static CK_RV rpc_C_DecryptMessage(CallState *cs)
 static CK_RV rpc_C_DecryptMessageBegin(CallState *cs)
 {
 	CK_SESSION_HANDLE session;
-	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	GckRpcParamState pst; CK_VOID_PTR parameter; CK_ULONG parameter_len;
 	CK_BYTE_PTR associated_data; CK_ULONG associated_data_len;
 	BEGIN_CALL_32(C_DecryptMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM(pst, parameter, parameter_len, GCK_RPC_PHASE_DEC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	PROCESS_CALL((session, parameter, parameter_len, associated_data, associated_data_len));
 	END_CALL;
@@ -2164,14 +2384,14 @@ static CK_RV rpc_C_DecryptMessageBegin(CallState *cs)
 static CK_RV rpc_C_DecryptMessageNext(CallState *cs)
 {
 	CK_SESSION_HANDLE session;
-	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
+	GckRpcParamState pst; CK_VOID_PTR parameter; CK_ULONG parameter_len;
 	CK_BYTE_PTR ciphertext_part; CK_ULONG ciphertext_part_len;
 	CK_BYTE_PTR plaintext_part;
 	DECLARE_CK_ULONG_PTR(plaintext_part_len);
 	CK_FLAGS flags;
 	BEGIN_CALL_32(C_DecryptMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM(pst, parameter, parameter_len, GCK_RPC_PHASE_DEC);
 	IN_BYTE_ARRAY(ciphertext_part, ciphertext_part_len);
 	IN_BYTE_BUFFER(plaintext_part, plaintext_part_len);
 	IN_ULONG(flags);
@@ -2211,7 +2431,7 @@ static CK_RV rpc_C_SignMessage(CallState *cs)
 	DECLARE_CK_ULONG_PTR(signature_len);
 	BEGIN_CALL_32(C_SignMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_BUFFER(signature, signature_len);
 	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
@@ -2225,7 +2445,7 @@ static CK_RV rpc_C_SignMessageBegin(CallState *cs)
 	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
 	BEGIN_CALL_32(C_SignMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	PROCESS_CALL((session, parameter, parameter_len));
 	END_CALL;
 }
@@ -2239,7 +2459,7 @@ static CK_RV rpc_C_SignMessageNext(CallState *cs)
 	DECLARE_CK_ULONG_PTR(signature_len);
 	BEGIN_CALL_32(C_SignMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_BUFFER(signature, signature_len);
 	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
@@ -2277,7 +2497,7 @@ static CK_RV rpc_C_VerifyMessage(CallState *cs)
 	CK_BYTE_PTR signature; CK_ULONG signature_len;
 	BEGIN_CALL_32(C_VerifyMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_ARRAY(signature, signature_len);
 	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
@@ -2290,7 +2510,7 @@ static CK_RV rpc_C_VerifyMessageBegin(CallState *cs)
 	CK_BYTE_PTR parameter; CK_ULONG parameter_len;
 	BEGIN_CALL_32(C_VerifyMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	PROCESS_CALL((session, parameter, parameter_len));
 	END_CALL;
 }
@@ -2303,7 +2523,7 @@ static CK_RV rpc_C_VerifyMessageNext(CallState *cs)
 	CK_BYTE_PTR signature; CK_ULONG signature_len;
 	BEGIN_CALL_32(C_VerifyMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY(parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_ARRAY(signature, signature_len);
 	PROCESS_CALL((session, parameter, parameter_len, data, data_len, signature, signature_len));
@@ -2423,10 +2643,24 @@ static CK_RV rpc_C_AsyncComplete(CallState *cs)
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR function_name; CK_ULONG function_name_len;
 	CK_ASYNC_DATA result;
+	CK_BYTE_PTR value;
+	DECLARE_CK_ULONG_PTR(value_len);
+	CK_UTF8CHAR_PTR name;
 	BEGIN_CALL_32(C_AsyncComplete);
+	memset(&result, 0, sizeof(result));
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(function_name, function_name_len);
-	PROCESS_CALL((session, (CK_UTF8CHAR_PTR)function_name, &result));
+	IN_ULONG(result.ulVersion);
+	IN_BYTE_BUFFER(value, value_len);
+	name = proto_cstring(cs, function_name, function_name_len);
+	if (!name) { _ret = CKR_ARGUMENTS_BAD; goto _cleanup; }
+	result.pValue = value;
+	result.ulValue = value_len ? *value_len : 0;
+	PROCESS_CALL((session, name, &result));
+	if (value_len)
+		*value_len = result.ulValue;
+	OUT_BYTE_ARRAY(value, value_len);
+	OUT_ULONG(result.ulVersion);
 	OUT_ULONG(result.hObject);
 	OUT_ULONG(result.hAdditionalObject);
 	END_CALL;
@@ -2436,11 +2670,14 @@ static CK_RV rpc_C_AsyncGetID(CallState *cs)
 {
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR function_name; CK_ULONG function_name_len;
-	CK_ULONG id;
+	CK_ULONG id = 0;
+	CK_UTF8CHAR_PTR name;
 	BEGIN_CALL_32(C_AsyncGetID);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(function_name, function_name_len);
-	PROCESS_CALL((session, (CK_UTF8CHAR_PTR)function_name, &id));
+	name = proto_cstring(cs, function_name, function_name_len);
+	if (!name) { _ret = CKR_ARGUMENTS_BAD; goto _cleanup; }
+	PROCESS_CALL((session, name, &id));
 	OUT_ULONG(id);
 	END_CALL;
 }
@@ -2450,13 +2687,21 @@ static CK_RV rpc_C_AsyncJoin(CallState *cs)
 	CK_SESSION_HANDLE session;
 	CK_BYTE_PTR function_name; CK_ULONG function_name_len;
 	CK_ULONG id;
-	CK_BYTE_PTR data; CK_ULONG data_len;
+	CK_BYTE_PTR data;
+	DECLARE_CK_ULONG_PTR(data_len);
+	CK_ULONG out_len;
+	CK_UTF8CHAR_PTR name;
 	BEGIN_CALL_32(C_AsyncJoin);
 	IN_ULONG(session);
 	IN_BYTE_ARRAY(function_name, function_name_len);
 	IN_ULONG(id);
-	IN_BYTE_ARRAY(data, data_len);
-	PROCESS_CALL((session, (CK_UTF8CHAR_PTR)function_name, id, data, data_len));
+	IN_BYTE_BUFFER(data, data_len);
+	name = proto_cstring(cs, function_name, function_name_len);
+	if (!name) { _ret = CKR_ARGUMENTS_BAD; goto _cleanup; }
+	out_len = data_len ? *data_len : 0;
+	PROCESS_CALL((session, name, id, data, out_len));
+	/* pData is filled to the length the caller asked for */
+	OUT_BYTE_ARRAY(data, &out_len);
 	END_CALL;
 }
 

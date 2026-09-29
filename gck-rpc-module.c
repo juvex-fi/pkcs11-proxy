@@ -1012,6 +1012,91 @@ proto_read_ulong_array(GckRpcMessage * msg, CK_ULONG_PTR arr,
 	return egg_buffer_has_error(&msg->buffer) ? PARSE_ERROR : CKR_OK;
 }
 
+#ifdef CKM_ML_DSA
+/* Serialize the optional additional context of ML-DSA/SLH-DSA mechanisms;
+ * see GCK_RPC_CONTEXT_* in gck-rpc-private.h for the wire format. */
+static CK_RV proto_write_context_parameter(GckRpcMessage * msg,
+					   CK_MECHANISM_PTR mech)
+{
+	unsigned char blob[16 + GCK_RPC_CONTEXT_MAX_LEN];
+	CK_HEDGE_TYPE hedge;
+	CK_MECHANISM_TYPE hash = 0;
+	CK_BYTE_PTR ctx;
+	CK_ULONG ctx_len, expect, off = 0;
+	int i, hashed;
+
+	hashed = gck_rpc_mechanism_context_kind(mech->mechanism) ==
+		 GCK_RPC_CONTEXT_HASH_SIGN;
+	expect = hashed ? sizeof(CK_HASH_SIGN_ADDITIONAL_CONTEXT) :
+			  sizeof(CK_SIGN_ADDITIONAL_CONTEXT);
+
+	if (mech->pParameter == NULL && mech->ulParameterLen == 0) {
+		/* No context given: send an empty parameter */
+		egg_buffer_add_byte_array(&msg->buffer, NULL, 0);
+		return egg_buffer_has_error(&msg->buffer) ? CKR_HOST_MEMORY : CKR_OK;
+	}
+	if (mech->pParameter == NULL || mech->ulParameterLen != expect)
+		return CKR_MECHANISM_PARAM_INVALID;
+
+	if (hashed) {
+		CK_HASH_SIGN_ADDITIONAL_CONTEXT *p = mech->pParameter;
+		hedge = p->hedgeVariant; hash = p->hash;
+		ctx = p->pContext; ctx_len = p->ulContextLen;
+	} else {
+		CK_SIGN_ADDITIONAL_CONTEXT *p = mech->pParameter;
+		hedge = p->hedgeVariant;
+		ctx = p->pContext; ctx_len = p->ulContextLen;
+	}
+	if (ctx_len > GCK_RPC_CONTEXT_MAX_LEN || (ctx_len != 0 && ctx == NULL))
+		return CKR_MECHANISM_PARAM_INVALID;
+
+	for (i = 7; i >= 0; --i)
+		blob[off++] = (unsigned char)((uint64_t)hedge >> (8 * i));
+	if (hashed)
+		for (i = 7; i >= 0; --i)
+			blob[off++] = (unsigned char)((uint64_t)hash >> (8 * i));
+	if (ctx_len)
+		memcpy(blob + off, ctx, ctx_len);
+	egg_buffer_add_byte_array(&msg->buffer, blob, off + ctx_len);
+
+	return egg_buffer_has_error(&msg->buffer) ? CKR_HOST_MEMORY : CKR_OK;
+}
+#endif
+
+#ifdef GCK_RPC_HAVE_V32
+/* Serialize CK_GCM_PARAMS, CK_CCM_PARAMS and friends field by field */
+static CK_RV proto_write_aead_parameter(GckRpcMessage * msg,
+					CK_MECHANISM_PTR mech)
+{
+	const GckRpcParamDesc *d = gck_rpc_param_desc_for_mechanism(mech->mechanism);
+	size_t cap = 1 + 8 * GCK_RPC_PARAM_MAX_FIELDS + 2 * GCK_RPC_PARAM_MAX_BUF;
+	unsigned char *blob;
+	size_t n = 0;
+	CK_RV rv;
+
+	if (mech->pParameter == NULL && mech->ulParameterLen == 0) {
+		/* Message-mode mechanisms carry their parameters per call */
+		egg_buffer_add_byte_array(&msg->buffer, NULL, 0);
+		return egg_buffer_has_error(&msg->buffer) ? CKR_HOST_MEMORY : CKR_OK;
+	}
+	if (mech->pParameter == NULL || mech->ulParameterLen != d->size)
+		return CKR_MECHANISM_PARAM_INVALID;
+
+	blob = malloc(cap);
+	if (blob == NULL)
+		return CKR_HOST_MEMORY;
+	rv = gck_rpc_param_encode(d, mech->pParameter, GCK_RPC_PHASE_MECH,
+				  blob, cap, &n);
+	if (rv == CKR_OK) {
+		egg_buffer_add_byte_array(&msg->buffer, blob, n);
+		if (egg_buffer_has_error(&msg->buffer))
+			rv = CKR_HOST_MEMORY;
+	}
+	free(blob);
+	return rv;
+}
+#endif
+
 static CK_RV proto_write_mechanism(GckRpcMessage * msg, CK_MECHANISM_PTR mech)
 {
 	assert(msg);
@@ -1040,6 +1125,14 @@ static CK_RV proto_write_mechanism(GckRpcMessage * msg, CK_MECHANISM_PTR mech)
 	else if (gck_rpc_mechanism_has_sane_parameters(mech->mechanism))
 		egg_buffer_add_byte_array(&msg->buffer, mech->pParameter,
 					  mech->ulParameterLen);
+#ifdef CKM_ML_DSA
+	else if (gck_rpc_mechanism_context_kind(mech->mechanism))
+		return proto_write_context_parameter(msg, mech);
+#endif
+#ifdef GCK_RPC_HAVE_V32
+	else if (gck_rpc_param_desc_for_mechanism(mech->mechanism))
+		return proto_write_aead_parameter(msg, mech);
+#endif
 	else
 		return CKR_MECHANISM_INVALID;
 
@@ -2469,6 +2562,11 @@ static CK_RV rpc_C_GetInterface(CK_UTF8CHAR_PTR pInterfaceName,
 
 	return_val_if_fail(ppInterface != NULL, CKR_ARGUMENTS_BAD);
 
+	/* Neither interface has any flags set (e.g. CKF_INTERFACE_FORK_SAFE),
+	 * so a request that requires one can't be satisfied. */
+	if (flags != 0)
+		return CKR_ARGUMENTS_BAD;
+
 	iface32.pFunctionList = &functionList32;
 	iface20.pFunctionList = &functionList;
 
@@ -2497,6 +2595,69 @@ static CK_RV rpc_C_GetInterface(CK_UTF8CHAR_PTR pInterfaceName,
 	*ppInterface = &iface32;
 	return CKR_OK;
 }
+
+#ifdef GCK_RPC_HAVE_V32
+/* Message parameters are serialized field by field (see gck_rpc_param_*) so
+ * that no pointer inside the caller's structure reaches the daemon. */
+#define MSG_PARAM_DECL \
+	const GckRpcParamDesc *_pd = NULL; \
+	unsigned char _pblob[GCK_RPC_MSGPARAM_BLOB], _rblob[GCK_RPC_MSGPARAM_BLOB]; \
+	CK_ULONG _pblen = 0, _rblen = 0;
+
+#define MSG_PARAM_DECL_IN \
+	const GckRpcParamDesc *_pd = NULL; \
+	unsigned char _pblob[GCK_RPC_MSGPARAM_BLOB]; \
+	CK_ULONG _pblen = 0;
+
+#define IN_MSG_PARAM(param, plen, phase) \
+	_ret = proto_msg_param_encode(param, plen, phase, &_pd, _pblob, \
+				      sizeof(_pblob), &_pblen); \
+	if (_ret != CKR_OK) goto _cleanup; \
+	IN_BYTE_ARRAY(_pblob, _pblen)
+
+/* Sign/verify message calls take no parameter */
+#define IN_MSG_PARAM_NONE(param, plen) \
+	if ((param) != NULL || (plen) != 0) \
+		{ _ret = CKR_MECHANISM_PARAM_INVALID; goto _cleanup; } \
+	if (!gck_rpc_message_write_byte_array (_cs->req, NULL, 0)) \
+		{ _ret = CKR_HOST_MEMORY; goto _cleanup; }
+
+#define OUT_MSG_PARAM_READ \
+	if (_ret == CKR_OK) { \
+		_rblen = sizeof(_rblob); \
+		_ret = proto_read_byte_array (_cs->resp, _rblob, &_rblen, \
+					      sizeof(_rblob)); \
+	}
+
+#define OUT_MSG_PARAM_APPLY(param) \
+	if (_ret == CKR_OK) \
+		_ret = gck_rpc_param_resp_apply(_pd, param, _rblob, _rblen);
+
+static CK_RV proto_msg_param_encode(CK_VOID_PTR param, CK_ULONG plen, int phase,
+				    const GckRpcParamDesc **pd,
+				    unsigned char *blob, size_t cap,
+				    CK_ULONG *blen)
+{
+	size_t n = 0;
+	CK_RV rv;
+
+	*pd = NULL;
+	*blen = 0;
+	if (param == NULL && plen == 0)
+		return CKR_OK;
+	if (param == NULL)
+		return CKR_MECHANISM_PARAM_INVALID;
+	*pd = gck_rpc_param_desc_for_message(plen);
+	if (*pd == NULL)
+		return CKR_MECHANISM_PARAM_INVALID;
+	rv = gck_rpc_param_encode(*pd, param, phase, blob, cap, &n);
+	if (rv != CKR_OK)
+		return rv;
+	*blen = n;
+	return CKR_OK;
+}
+#endif
+
 
 static CK_RV rpc_C_LoginUser(CK_SESSION_HANDLE session, CK_USER_TYPE user_type,
 			      CK_UTF8CHAR_PTR pin, CK_ULONG pin_len,
@@ -2541,15 +2702,18 @@ static CK_RV rpc_C_EncryptMessage(CK_SESSION_HANDLE session,
 				   CK_BYTE_PTR plaintext, CK_ULONG plaintext_len,
 				   CK_BYTE_PTR ciphertext, CK_ULONG_PTR ciphertext_len)
 {
+	MSG_PARAM_DECL
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_EncryptMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM(parameter, parameter_len, GCK_RPC_PHASE_ENC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	IN_BYTE_ARRAY(plaintext, plaintext_len);
 	IN_BYTE_BUFFER(ciphertext, ciphertext_len);
 	PROCESS_CALL;
+	OUT_MSG_PARAM_READ;
 	OUT_BYTE_ARRAY2(ciphertext, ciphertext_len);
+	OUT_MSG_PARAM_APPLY(parameter);
 	END_CALL;
 }
 
@@ -2557,12 +2721,15 @@ static CK_RV rpc_C_EncryptMessageBegin(CK_SESSION_HANDLE session,
 					CK_VOID_PTR parameter, CK_ULONG parameter_len,
 					CK_BYTE_PTR associated_data, CK_ULONG associated_data_len)
 {
+	MSG_PARAM_DECL
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_EncryptMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM(parameter, parameter_len, GCK_RPC_PHASE_ENC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	PROCESS_CALL;
+	OUT_MSG_PARAM_READ;
+	OUT_MSG_PARAM_APPLY(parameter);
 	END_CALL;
 }
 
@@ -2572,15 +2739,18 @@ static CK_RV rpc_C_EncryptMessageNext(CK_SESSION_HANDLE session,
 				       CK_BYTE_PTR ciphertext_part, CK_ULONG_PTR ciphertext_part_len,
 				       CK_FLAGS flags)
 {
+	MSG_PARAM_DECL
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_EncryptMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM(parameter, parameter_len, GCK_RPC_PHASE_ENC);
 	IN_BYTE_ARRAY(plaintext_part, plaintext_part_len);
 	IN_BYTE_BUFFER(ciphertext_part, ciphertext_part_len);
 	IN_ULONG(flags);
 	PROCESS_CALL;
+	OUT_MSG_PARAM_READ;
 	OUT_BYTE_ARRAY2(ciphertext_part, ciphertext_part_len);
+	OUT_MSG_PARAM_APPLY(parameter);
 	END_CALL;
 }
 
@@ -2612,10 +2782,11 @@ static CK_RV rpc_C_DecryptMessage(CK_SESSION_HANDLE session,
 				   CK_BYTE_PTR ciphertext, CK_ULONG ciphertext_len,
 				   CK_BYTE_PTR plaintext, CK_ULONG_PTR plaintext_len)
 {
+	MSG_PARAM_DECL_IN
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_DecryptMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM(parameter, parameter_len, GCK_RPC_PHASE_DEC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	IN_BYTE_ARRAY(ciphertext, ciphertext_len);
 	IN_BYTE_BUFFER(plaintext, plaintext_len);
@@ -2628,10 +2799,11 @@ static CK_RV rpc_C_DecryptMessageBegin(CK_SESSION_HANDLE session,
 					CK_VOID_PTR parameter, CK_ULONG parameter_len,
 					CK_BYTE_PTR associated_data, CK_ULONG associated_data_len)
 {
+	MSG_PARAM_DECL_IN
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_DecryptMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM(parameter, parameter_len, GCK_RPC_PHASE_DEC);
 	IN_BYTE_ARRAY(associated_data, associated_data_len);
 	PROCESS_CALL;
 	END_CALL;
@@ -2643,10 +2815,11 @@ static CK_RV rpc_C_DecryptMessageNext(CK_SESSION_HANDLE session,
 				       CK_BYTE_PTR plaintext_part, CK_ULONG_PTR plaintext_part_len,
 				       CK_FLAGS flags)
 {
+	MSG_PARAM_DECL_IN
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_DecryptMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM(parameter, parameter_len, GCK_RPC_PHASE_DEC);
 	IN_BYTE_ARRAY(ciphertext_part, ciphertext_part_len);
 	IN_BYTE_BUFFER(plaintext_part, plaintext_part_len);
 	IN_ULONG(flags);
@@ -2685,7 +2858,7 @@ static CK_RV rpc_C_SignMessage(CK_SESSION_HANDLE session,
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_SignMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_BUFFER(signature, signature_len);
 	PROCESS_CALL;
@@ -2699,7 +2872,7 @@ static CK_RV rpc_C_SignMessageBegin(CK_SESSION_HANDLE session,
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_SignMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2712,7 +2885,7 @@ static CK_RV rpc_C_SignMessageNext(CK_SESSION_HANDLE session,
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_SignMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_BUFFER(signature, signature_len);
 	PROCESS_CALL;
@@ -2750,7 +2923,7 @@ static CK_RV rpc_C_VerifyMessage(CK_SESSION_HANDLE session,
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_VerifyMessage);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_ARRAY(signature, signature_len);
 	PROCESS_CALL;
@@ -2763,7 +2936,7 @@ static CK_RV rpc_C_VerifyMessageBegin(CK_SESSION_HANDLE session,
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_VerifyMessageBegin);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	PROCESS_CALL;
 	END_CALL;
 }
@@ -2776,7 +2949,7 @@ static CK_RV rpc_C_VerifyMessageNext(CK_SESSION_HANDLE session,
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	BEGIN_CALL(C_VerifyMessageNext);
 	IN_ULONG(session);
-	IN_BYTE_ARRAY((CK_BYTE_PTR)parameter, parameter_len);
+	IN_MSG_PARAM_NONE(parameter, parameter_len);
 	IN_BYTE_ARRAY(data, data_len);
 	IN_BYTE_ARRAY(signature, signature_len);
 	PROCESS_CALL;
@@ -2902,7 +3075,11 @@ static CK_RV rpc_C_AsyncComplete(CK_SESSION_HANDLE session,
 		BEGIN_CALL(C_AsyncComplete);
 		IN_ULONG(session);
 		IN_BYTE_ARRAY(function_name, fname_len);
+		IN_ULONG(result->ulVersion);
+		IN_BYTE_BUFFER(result->pValue, &result->ulValue);
 		PROCESS_CALL;
+		OUT_BYTE_ARRAY2(result->pValue, &result->ulValue);
+		OUT_ULONG(&result->ulVersion);
 		OUT_ULONG(&result->hObject);
 		OUT_ULONG(&result->hAdditionalObject);
 		END_CALL;
@@ -2934,12 +3111,14 @@ static CK_RV rpc_C_AsyncJoin(CK_SESSION_HANDLE session,
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
 	{
 		CK_ULONG fname_len = function_name ? strlen((char *)function_name) : 0;
+		CK_ULONG out_len = data_len;
 		BEGIN_CALL(C_AsyncJoin);
 		IN_ULONG(session);
 		IN_BYTE_ARRAY(function_name, fname_len);
 		IN_ULONG(id);
-		IN_BYTE_ARRAY(data, data_len);
+		IN_BYTE_BUFFER(data, &out_len);
 		PROCESS_CALL;
+		OUT_BYTE_ARRAY2(data, &out_len);
 		END_CALL;
 	}
 }
@@ -2999,7 +3178,7 @@ static CK_RV rpc_C_UnwrapKeyAuthenticated(CK_SESSION_HANDLE session,
  */
 
 static CK_FUNCTION_LIST functionList = {
-	{CRYPTOKI_VERSION_MAJOR, CRYPTOKI_VERSION_MINOR},	/* version */
+	{2, 40},							/* the 2.x struct layout */
 	rpc_C_Initialize,
 	rpc_C_Finalize,
 	rpc_C_GetInfo,
@@ -3076,6 +3255,18 @@ CK_RV C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR list)
 
 	*list = &functionList;
 	return CKR_OK;
+}
+
+/* Exported so PKCS#11 v3.x consumers can discover the 3.2 function list */
+CK_RV C_GetInterfaceList(CK_INTERFACE_PTR pInterfacesList, CK_ULONG_PTR pulCount)
+{
+	return rpc_C_GetInterfaceList(pInterfacesList, pulCount);
+}
+
+CK_RV C_GetInterface(CK_UTF8CHAR_PTR pInterfaceName, CK_VERSION_PTR pVersion,
+		     CK_INTERFACE_PTR_PTR ppInterface, CK_FLAGS flags)
+{
+	return rpc_C_GetInterface(pInterfaceName, pVersion, ppInterface, flags);
 }
 
 /* v3.2 function list - includes all functions including v3.0 and v3.2 additions */

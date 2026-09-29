@@ -242,9 +242,9 @@ static const GckRpcCall gck_rpc_calls[] = {
 	{GCK_RPC_CALL_C_LoginUser, "C_LoginUser", "uuayay", ""},
 	{GCK_RPC_CALL_C_SessionCancel, "C_SessionCancel", "uu", ""},
 	{GCK_RPC_CALL_C_MessageEncryptInit, "C_MessageEncryptInit", "uMu", ""},
-	{GCK_RPC_CALL_C_EncryptMessage, "C_EncryptMessage", "uayayayfy", "ay"},
-	{GCK_RPC_CALL_C_EncryptMessageBegin, "C_EncryptMessageBegin", "uayay", ""},
-	{GCK_RPC_CALL_C_EncryptMessageNext, "C_EncryptMessageNext", "uayayfyu", "ay"},
+	{GCK_RPC_CALL_C_EncryptMessage, "C_EncryptMessage", "uayayayfy", "ayay"},
+	{GCK_RPC_CALL_C_EncryptMessageBegin, "C_EncryptMessageBegin", "uayay", "ay"},
+	{GCK_RPC_CALL_C_EncryptMessageNext, "C_EncryptMessageNext", "uayayfyu", "ayay"},
 	{GCK_RPC_CALL_C_MessageEncryptFinal, "C_MessageEncryptFinal", "u", ""},
 	{GCK_RPC_CALL_C_MessageDecryptInit, "C_MessageDecryptInit", "uMu", ""},
 	{GCK_RPC_CALL_C_DecryptMessage, "C_DecryptMessage", "uayayayfy", "ay"},
@@ -268,9 +268,9 @@ static const GckRpcCall gck_rpc_calls[] = {
 	{GCK_RPC_CALL_C_VerifySignatureUpdate, "C_VerifySignatureUpdate", "uay", ""},
 	{GCK_RPC_CALL_C_VerifySignatureFinal, "C_VerifySignatureFinal", "u", ""},
 	{GCK_RPC_CALL_C_GetSessionValidationFlags, "C_GetSessionValidationFlags", "uu", "u"},
-	{GCK_RPC_CALL_C_AsyncComplete, "C_AsyncComplete", "uay", "uu"},
+	{GCK_RPC_CALL_C_AsyncComplete, "C_AsyncComplete", "uayufy", "ayuuu"},
 	{GCK_RPC_CALL_C_AsyncGetID, "C_AsyncGetID", "uay", "u"},
-	{GCK_RPC_CALL_C_AsyncJoin, "C_AsyncJoin", "uayuay", ""},
+	{GCK_RPC_CALL_C_AsyncJoin, "C_AsyncJoin", "uayufy", "ay"},
 	{GCK_RPC_CALL_C_WrapKeyAuthenticated, "C_WrapKeyAuthenticated", "uMuuayfy", "ay"},
 	{GCK_RPC_CALL_C_UnwrapKeyAuthenticated, "C_UnwrapKeyAuthenticated", "uMuayaAay", "u"},
 };
@@ -387,6 +387,80 @@ void gck_rpc_mechanism_list_purge(CK_MECHANISM_TYPE_PTR mechs,
 				  CK_ULONG_PTR n_mechs);
 int gck_rpc_mechanism_has_sane_parameters(CK_MECHANISM_TYPE type);
 int gck_rpc_mechanism_has_no_parameters(CK_MECHANISM_TYPE mech);
+
+/* Mechanisms with an optional CK_[HASH_]SIGN_ADDITIONAL_CONTEXT parameter.
+ * Wire format of the parameter: empty when the caller passed none, otherwise
+ * hedgeVariant (8 bytes BE), [hash (8 bytes BE), HASH_SIGN only], context. */
+#define GCK_RPC_CONTEXT_SIGN		1
+#define GCK_RPC_CONTEXT_HASH_SIGN	2
+#define GCK_RPC_CONTEXT_MAX_LEN		255
+int gck_rpc_mechanism_context_kind(CK_MECHANISM_TYPE mech);
+
+#ifdef CKM_ML_DSA
+#define GCK_RPC_HAVE_V32 1
+
+/*
+ * Field-by-field serialization of the pointer-carrying AEAD parameter
+ * structures (CK_GCM_PARAMS, CK_GCM_MESSAGE_PARAMS, ...), so that no
+ * client pointer ever reaches the daemon's module.
+ *
+ * Wire blob: kind byte, every CK_ULONG field as 8 bytes BE (table order),
+ * then the bytes of the buffers sent in the given phase (table order).
+ * After an encrypt-message call the daemon returns the buffers flagged
+ * `resp` (generated IV/nonce and tag) as one concatenated byte array.
+ */
+#define GCK_RPC_PHASE_MECH	1	/* mechanism parameter (input only) */
+#define GCK_RPC_PHASE_ENC	2	/* C_Encrypt<Message*> parameter */
+#define GCK_RPC_PHASE_DEC	4	/* C_Decrypt<Message*> parameter */
+#define GCK_RPC_PARAM_MAX_BUF	65536
+#define GCK_RPC_MSGPARAM_BLOB	2400	/* stack blob for message params */
+#define GCK_RPC_PARAM_MAX_FIELDS 8
+
+typedef struct {
+	int is_buf;		/* 0: CK_ULONG field, 1: CK_BYTE_PTR field */
+	size_t off;		/* offset in the CK_* structure */
+	int len_idx;		/* buf: index of the field giving its length */
+	int len_bits;		/* buf: that field counts bits */
+	size_t len_fixed;	/* buf: fixed length (when len_idx < 0) */
+	int req;		/* buf: phases in which its bytes are sent */
+	int resp;		/* buf: returned after an encrypt-message call */
+} GckRpcParamField;
+
+typedef struct {
+	int kind;
+	int phases;		/* phases this structure may be used in */
+	size_t size;		/* sizeof the CK_* structure */
+	int nfields;
+	const GckRpcParamField *fields;
+} GckRpcParamDesc;
+
+typedef struct {
+	const GckRpcParamDesc *desc;
+	union {
+		CK_GCM_PARAMS gcm;
+		CK_GCM_MESSAGE_PARAMS gcm_msg;
+		CK_CCM_PARAMS ccm;
+		CK_CCM_MESSAGE_PARAMS ccm_msg;
+		CK_SALSA20_CHACHA20_POLY1305_PARAMS chacha;
+		CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS chacha_msg;
+	} s;
+	size_t lens[GCK_RPC_PARAM_MAX_FIELDS];
+} GckRpcParamState;
+
+const GckRpcParamDesc *gck_rpc_param_desc_for_mechanism(CK_MECHANISM_TYPE mech);
+const GckRpcParamDesc *gck_rpc_param_desc_for_message(CK_ULONG param_len);
+CK_RV gck_rpc_param_encode(const GckRpcParamDesc *d, const void *param,
+			   int phase, unsigned char *out, size_t cap,
+			   size_t *out_len);
+CK_RV gck_rpc_param_decode(const unsigned char *blob, size_t n, int phase,
+			   GckRpcParamState *st,
+			   void *(*alloc)(void *, size_t), void *ctx);
+CK_RV gck_rpc_param_resp_encode(const GckRpcParamState *st,
+				unsigned char *out, size_t cap,
+				size_t *out_len);
+CK_RV gck_rpc_param_resp_apply(const GckRpcParamDesc *d, void *param,
+			       const unsigned char *blob, size_t n);
+#endif
 int gck_rpc_has_bad_sized_ulong_parameter(CK_ATTRIBUTE_PTR attr);
 int gck_rpc_has_ulong_parameter(CK_ATTRIBUTE_TYPE type);
 

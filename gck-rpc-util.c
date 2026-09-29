@@ -27,6 +27,8 @@
 #include "gck-rpc-private.h"
 
 #include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -63,9 +65,55 @@ void gck_rpc_debug(const char *msg, ...)
 int gck_rpc_mechanism_is_supported(CK_MECHANISM_TYPE mech)
 {
 	if (gck_rpc_mechanism_has_no_parameters(mech) ||
-	    gck_rpc_mechanism_has_sane_parameters(mech))
+	    gck_rpc_mechanism_has_sane_parameters(mech) ||
+	    gck_rpc_mechanism_context_kind(mech))
 		return 1;
+#ifdef GCK_RPC_HAVE_V32
+	if (gck_rpc_param_desc_for_mechanism(mech))
+		return 1;
+#endif
 	return 0;
+}
+
+/*
+ * The v3.2 ML-DSA and SLH-DSA mechanisms take an optional additional
+ * context structure holding a pointer to the context string, so they
+ * can't be copied verbatim; they are serialized field by field instead.
+ */
+int gck_rpc_mechanism_context_kind(CK_MECHANISM_TYPE mech)
+{
+	switch (mech) {
+#ifdef CKM_ML_DSA
+	case CKM_HASH_ML_DSA:
+	case CKM_HASH_SLH_DSA:
+		return GCK_RPC_CONTEXT_HASH_SIGN;
+	case CKM_ML_DSA:
+	case CKM_HASH_ML_DSA_SHA224:
+	case CKM_HASH_ML_DSA_SHA256:
+	case CKM_HASH_ML_DSA_SHA384:
+	case CKM_HASH_ML_DSA_SHA512:
+	case CKM_HASH_ML_DSA_SHA3_224:
+	case CKM_HASH_ML_DSA_SHA3_256:
+	case CKM_HASH_ML_DSA_SHA3_384:
+	case CKM_HASH_ML_DSA_SHA3_512:
+	case CKM_HASH_ML_DSA_SHAKE128:
+	case CKM_HASH_ML_DSA_SHAKE256:
+	case CKM_SLH_DSA:
+	case CKM_HASH_SLH_DSA_SHA224:
+	case CKM_HASH_SLH_DSA_SHA256:
+	case CKM_HASH_SLH_DSA_SHA384:
+	case CKM_HASH_SLH_DSA_SHA512:
+	case CKM_HASH_SLH_DSA_SHA3_224:
+	case CKM_HASH_SLH_DSA_SHA3_256:
+	case CKM_HASH_SLH_DSA_SHA3_384:
+	case CKM_HASH_SLH_DSA_SHA3_512:
+	case CKM_HASH_SLH_DSA_SHAKE128:
+	case CKM_HASH_SLH_DSA_SHAKE256:
+		return GCK_RPC_CONTEXT_SIGN;
+#endif
+	default:
+		return 0;
+	}
 }
 
 void
@@ -77,8 +125,7 @@ gck_rpc_mechanism_list_purge(CK_MECHANISM_TYPE_PTR mechs, CK_ULONG * n_mechs)
 	assert(n_mechs);
 
 	for (i = 0; i < (int)(*n_mechs); ++i) {
-		if (!gck_rpc_mechanism_has_no_parameters(mechs[i]) &&
-		    !gck_rpc_mechanism_has_sane_parameters(mechs[i])) {
+		if (!gck_rpc_mechanism_is_supported(mechs[i])) {
 
 			/* Remove the mechanism from the list */
 			memmove(&mechs[i], &mechs[i + 1],
@@ -89,6 +136,342 @@ gck_rpc_mechanism_list_purge(CK_MECHANISM_TYPE_PTR mechs, CK_ULONG * n_mechs)
 		}
 	}
 }
+
+#ifdef GCK_RPC_HAVE_V32
+
+#define U_(s, m) { 0, offsetof(s, m), 0, 0, 0, 0, 0 }
+#define B_(s, m, idx, bits, fixed, req, resp) \
+	{ 1, offsetof(s, m), idx, bits, fixed, req, resp }
+#define PH_MSG (GCK_RPC_PHASE_ENC | GCK_RPC_PHASE_DEC)
+
+static const GckRpcParamField gcm_msg_fields[] = {
+	B_(CK_GCM_MESSAGE_PARAMS, pIv, 1, 0, 0, PH_MSG, 1),
+	U_(CK_GCM_MESSAGE_PARAMS, ulIvLen),
+	U_(CK_GCM_MESSAGE_PARAMS, ulIvFixedBits),
+	U_(CK_GCM_MESSAGE_PARAMS, ivGenerator),
+	B_(CK_GCM_MESSAGE_PARAMS, pTag, 5, 1, 0, PH_MSG, 1),
+	U_(CK_GCM_MESSAGE_PARAMS, ulTagBits),
+};
+static const GckRpcParamField ccm_msg_fields[] = {
+	U_(CK_CCM_MESSAGE_PARAMS, ulDataLen),
+	B_(CK_CCM_MESSAGE_PARAMS, pNonce, 2, 0, 0, PH_MSG, 1),
+	U_(CK_CCM_MESSAGE_PARAMS, ulNonceLen),
+	U_(CK_CCM_MESSAGE_PARAMS, ulNonceFixedBits),
+	U_(CK_CCM_MESSAGE_PARAMS, nonceGenerator),
+	B_(CK_CCM_MESSAGE_PARAMS, pMAC, 6, 0, 0, PH_MSG, 1),
+	U_(CK_CCM_MESSAGE_PARAMS, ulMACLen),
+};
+static const GckRpcParamField chacha_msg_fields[] = {
+	B_(CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS, pNonce, 1, 0, 0, PH_MSG, 1),
+	U_(CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS, ulNonceLen),
+	B_(CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS, pTag, -1, 0, 16,
+	   PH_MSG, 1),
+};
+static const GckRpcParamField gcm_fields[] = {
+	B_(CK_GCM_PARAMS, pIv, 1, 0, 0, GCK_RPC_PHASE_MECH, 0),
+	U_(CK_GCM_PARAMS, ulIvLen),
+	U_(CK_GCM_PARAMS, ulIvBits),
+	B_(CK_GCM_PARAMS, pAAD, 4, 0, 0, GCK_RPC_PHASE_MECH, 0),
+	U_(CK_GCM_PARAMS, ulAADLen),
+	U_(CK_GCM_PARAMS, ulTagBits),
+};
+static const GckRpcParamField ccm_fields[] = {
+	U_(CK_CCM_PARAMS, ulDataLen),
+	B_(CK_CCM_PARAMS, pNonce, 2, 0, 0, GCK_RPC_PHASE_MECH, 0),
+	U_(CK_CCM_PARAMS, ulNonceLen),
+	B_(CK_CCM_PARAMS, pAAD, 4, 0, 0, GCK_RPC_PHASE_MECH, 0),
+	U_(CK_CCM_PARAMS, ulAADLen),
+	U_(CK_CCM_PARAMS, ulMACLen),
+};
+static const GckRpcParamField chacha_fields[] = {
+	B_(CK_SALSA20_CHACHA20_POLY1305_PARAMS, pNonce, 1, 0, 0, GCK_RPC_PHASE_MECH, 0),
+	U_(CK_SALSA20_CHACHA20_POLY1305_PARAMS, ulNonceLen),
+	B_(CK_SALSA20_CHACHA20_POLY1305_PARAMS, pAAD, 3, 0, 0, GCK_RPC_PHASE_MECH, 0),
+	U_(CK_SALSA20_CHACHA20_POLY1305_PARAMS, ulAADLen),
+};
+
+#define NF_(a) ((int)(sizeof(a) / sizeof((a)[0])))
+static const GckRpcParamDesc param_descs[] = {
+	{ 1, PH_MSG, sizeof(CK_GCM_MESSAGE_PARAMS), NF_(gcm_msg_fields), gcm_msg_fields },
+	{ 2, PH_MSG, sizeof(CK_CCM_MESSAGE_PARAMS), NF_(ccm_msg_fields), ccm_msg_fields },
+	{ 3, PH_MSG, sizeof(CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS), NF_(chacha_msg_fields), chacha_msg_fields },
+	{ 4, GCK_RPC_PHASE_MECH, sizeof(CK_GCM_PARAMS), NF_(gcm_fields), gcm_fields },
+	{ 5, GCK_RPC_PHASE_MECH, sizeof(CK_CCM_PARAMS), NF_(ccm_fields), ccm_fields },
+	{ 6, GCK_RPC_PHASE_MECH, sizeof(CK_SALSA20_CHACHA20_POLY1305_PARAMS), NF_(chacha_fields), chacha_fields },
+};
+
+const GckRpcParamDesc *gck_rpc_param_desc_for_mechanism(CK_MECHANISM_TYPE mech)
+{
+	switch (mech) {
+	case CKM_AES_GCM:
+		return &param_descs[3];
+	case CKM_AES_CCM:
+		return &param_descs[4];
+	case CKM_CHACHA20_POLY1305:
+	case CKM_SALSA20_POLY1305:
+		return &param_descs[5];
+	default:
+		return NULL;
+	}
+}
+
+/* The message structures differ in size, which tells them apart. */
+const GckRpcParamDesc *gck_rpc_param_desc_for_message(CK_ULONG param_len)
+{
+	int i;
+
+	for (i = 0; i < 3; ++i)
+		if (param_descs[i].size == param_len)
+			return &param_descs[i];
+	return NULL;
+}
+
+static CK_ULONG param_get_ulong(const void *base, const GckRpcParamField *f)
+{
+	CK_ULONG v;
+	memcpy(&v, (const char *)base + f->off, sizeof(v));
+	return v;
+}
+
+/* Length in bytes of buffer field i, read from the structure in `base`. */
+static CK_RV param_buf_len(const GckRpcParamDesc *d, const void *base, int i,
+			   size_t *len)
+{
+	const GckRpcParamField *f = &d->fields[i];
+	CK_ULONG v;
+
+	if (f->len_idx < 0) {
+		*len = f->len_fixed;
+		return CKR_OK;
+	}
+	v = param_get_ulong(base, &d->fields[f->len_idx]);
+	if (f->len_bits) {
+		if (v > (CK_ULONG)GCK_RPC_PARAM_MAX_BUF * 8)
+			return CKR_MECHANISM_PARAM_INVALID;
+		v = (v + 7) / 8;
+	}
+	if (v > GCK_RPC_PARAM_MAX_BUF)
+		return CKR_MECHANISM_PARAM_INVALID;
+	*len = (size_t)v;
+	return CKR_OK;
+}
+
+static void put_be64(unsigned char *p, uint64_t v)
+{
+	int i;
+	for (i = 7; i >= 0; --i)
+		*p++ = (unsigned char)(v >> (8 * i));
+}
+
+static uint64_t get_be64(const unsigned char *p)
+{
+	uint64_t v = 0;
+	int i;
+	for (i = 0; i < 8; ++i)
+		v = (v << 8) | p[i];
+	return v;
+}
+
+CK_RV gck_rpc_param_encode(const GckRpcParamDesc *d, const void *param,
+			   int phase, unsigned char *out, size_t cap,
+			   size_t *out_len)
+{
+	size_t n = 1, len;
+	CK_BYTE_PTR ptr;
+	CK_RV rv;
+	int i;
+
+	if (!d || !param || !(d->phases & phase))
+		return CKR_MECHANISM_PARAM_INVALID;
+	if (cap < 1)
+		return CKR_MECHANISM_PARAM_INVALID;
+	out[0] = (unsigned char)d->kind;
+
+	for (i = 0; i < d->nfields; ++i) {
+		if (d->fields[i].is_buf)
+			continue;
+		if (n + 8 > cap)
+			return CKR_MECHANISM_PARAM_INVALID;
+		put_be64(out + n, param_get_ulong(param, &d->fields[i]));
+		n += 8;
+	}
+	for (i = 0; i < d->nfields; ++i) {
+		if (!d->fields[i].is_buf || !(d->fields[i].req & phase))
+			continue;
+		rv = param_buf_len(d, param, i, &len);
+		if (rv != CKR_OK)
+			return rv;
+		memcpy(&ptr, (const char *)param + d->fields[i].off, sizeof(ptr));
+		if (len && !ptr)
+			return CKR_MECHANISM_PARAM_INVALID;
+		if (len > cap - n)
+			return CKR_MECHANISM_PARAM_INVALID;
+		if (len)
+			memcpy(out + n, ptr, len);
+		n += len;
+	}
+	if (phase == GCK_RPC_PHASE_ENC) {
+		/* The returned IV/nonce and tag must fit a blob of this size */
+		size_t resp = 0;
+
+		for (i = 0; i < d->nfields; ++i) {
+			if (!d->fields[i].is_buf || !d->fields[i].resp)
+				continue;
+			rv = param_buf_len(d, param, i, &len);
+			if (rv != CKR_OK)
+				return rv;
+			resp += len;
+		}
+		if (resp > cap)
+			return CKR_MECHANISM_PARAM_INVALID;
+	}
+	*out_len = n;
+	return CKR_OK;
+}
+
+CK_RV gck_rpc_param_decode(const unsigned char *blob, size_t n, int phase,
+			   GckRpcParamState *st,
+			   void *(*alloc)(void *, size_t), void *ctx)
+{
+	const GckRpcParamDesc *d = NULL;
+	size_t pos = 1, total = 0, len, used = 0;
+	unsigned char *work;
+	CK_RV rv;
+	int i;
+
+	memset(st, 0, sizeof(*st));
+	if (n < 1)
+		return CKR_MECHANISM_PARAM_INVALID;
+	for (i = 0; i < (int)(sizeof(param_descs) / sizeof(param_descs[0])); ++i)
+		if (param_descs[i].kind == blob[0])
+			d = &param_descs[i];
+	if (!d || !(d->phases & phase) || d->nfields > GCK_RPC_PARAM_MAX_FIELDS)
+		return CKR_MECHANISM_PARAM_INVALID;
+
+	/* CK_ULONG fields */
+	for (i = 0; i < d->nfields; ++i) {
+		uint64_t v;
+		CK_ULONG u;
+
+		if (d->fields[i].is_buf)
+			continue;
+		if (n - pos < 8)
+			return CKR_MECHANISM_PARAM_INVALID;
+		v = get_be64(blob + pos);
+		pos += 8;
+		u = (CK_ULONG)v;
+		if ((uint64_t)u != v)
+			return CKR_MECHANISM_PARAM_INVALID;
+		memcpy((char *)&st->s + d->fields[i].off, &u, sizeof(u));
+	}
+
+	/* Buffer lengths; every buffer gets private, writable backing */
+	for (i = 0; i < d->nfields; ++i) {
+		if (!d->fields[i].is_buf)
+			continue;
+		rv = param_buf_len(d, &st->s, i, &len);
+		if (rv != CKR_OK)
+			return rv;
+		st->lens[i] = len;
+		total += len;
+		if (d->fields[i].req & phase) {
+			if (len > n - pos)
+				return CKR_MECHANISM_PARAM_INVALID;
+			pos += len;	/* checked again below when copying */
+		}
+	}
+	if (pos != n)
+		return CKR_MECHANISM_PARAM_INVALID;
+
+	work = alloc(ctx, total + 1);
+	if (!work)
+		return CKR_DEVICE_MEMORY;
+	memset(work, 0, total + 1);
+
+	pos = 1 + 8 * (size_t)0;
+	for (i = 0; i < d->nfields; ++i)
+		if (!d->fields[i].is_buf)
+			pos += 8;
+	for (i = 0; i < d->nfields; ++i) {
+		CK_BYTE_PTR p;
+
+		if (!d->fields[i].is_buf)
+			continue;
+		len = st->lens[i];
+		p = len ? work + used : NULL;
+		if (len && (d->fields[i].req & phase)) {
+			memcpy(p, blob + pos, len);
+			pos += len;
+		}
+		used += len;
+		memcpy((char *)&st->s + d->fields[i].off, &p, sizeof(p));
+	}
+	st->desc = d;
+	return CKR_OK;
+}
+
+CK_RV gck_rpc_param_resp_encode(const GckRpcParamState *st,
+				unsigned char *out, size_t cap,
+				size_t *out_len)
+{
+	const GckRpcParamDesc *d = st->desc;
+	size_t n = 0;
+	CK_BYTE_PTR p;
+	int i;
+
+	for (i = 0; d && i < d->nfields; ++i) {
+		if (!d->fields[i].is_buf || !d->fields[i].resp)
+			continue;
+		if (st->lens[i] > cap - n)
+			return CKR_DEVICE_MEMORY;
+		memcpy(&p, (const char *)&st->s + d->fields[i].off, sizeof(p));
+		if (st->lens[i])
+			memcpy(out + n, p, st->lens[i]);
+		n += st->lens[i];
+	}
+	*out_len = n;
+	return CKR_OK;
+}
+
+CK_RV gck_rpc_param_resp_apply(const GckRpcParamDesc *d, void *param,
+			       const unsigned char *blob, size_t n)
+{
+	size_t pos = 0, len;
+	CK_BYTE_PTR p;
+	CK_RV rv;
+	int i;
+
+	if (!d)
+		return n == 0 ? CKR_OK : CKR_DEVICE_ERROR;
+
+	/* Check the whole blob fits before touching the caller's buffers */
+	for (i = 0; i < d->nfields; ++i) {
+		if (!d->fields[i].is_buf || !d->fields[i].resp)
+			continue;
+		rv = param_buf_len(d, param, i, &len);
+		if (rv != CKR_OK)
+			return rv;
+		if (len > n - pos)
+			return CKR_DEVICE_ERROR;
+		pos += len;
+	}
+	if (pos != n)
+		return CKR_DEVICE_ERROR;
+
+	pos = 0;
+	for (i = 0; i < d->nfields; ++i) {
+		if (!d->fields[i].is_buf || !d->fields[i].resp)
+			continue;
+		param_buf_len(d, param, i, &len);
+		memcpy(&p, (char *)param + d->fields[i].off, sizeof(p));
+		if (len && p)
+			memcpy(p, blob + pos, len);
+		pos += len;
+	}
+	return CKR_OK;
+}
+
+#endif /* GCK_RPC_HAVE_V32 */
 
 int gck_rpc_mechanism_has_sane_parameters(CK_MECHANISM_TYPE type)
 {
@@ -228,6 +611,18 @@ int gck_rpc_mechanism_has_no_parameters(CK_MECHANISM_TYPE mech)
 	case CKM_SHA3_512_HMAC:
 	case CKM_EC_EDWARDS_KEY_PAIR_GEN:
 	case CKM_EC_MONTGOMERY_KEY_PAIR_GEN:
+#ifdef CKM_ML_KEM
+	case CKM_ML_KEM_KEY_PAIR_GEN:
+	case CKM_ML_KEM:
+	case CKM_ML_DSA_KEY_PAIR_GEN:
+	case CKM_SLH_DSA_KEY_PAIR_GEN:
+	case CKM_HSS_KEY_PAIR_GEN:
+	case CKM_HSS:
+	case CKM_XMSS_KEY_PAIR_GEN:
+	case CKM_XMSSMT_KEY_PAIR_GEN:
+	case CKM_XMSS:
+	case CKM_XMSSMT:
+#endif
 		return 1;
 	default:
 		return 0;
@@ -243,6 +638,13 @@ gck_rpc_has_ulong_parameter(CK_ATTRIBUTE_TYPE type)
 	case CKA_CERTIFICATE_TYPE:
 	case CKA_HW_FEATURE_TYPE:
         case CKA_MODULUS_BITS:
+#ifdef CKA_PARAMETER_SET
+	case CKA_PARAMETER_SET:
+	case CKA_HSS_LEVELS:
+	case CKA_HSS_LMS_TYPE:
+	case CKA_HSS_LMOTS_TYPE:
+	case CKA_HSS_KEYS_REMAINING:
+#endif
 		return 1;
 	default:
 		return 0;
