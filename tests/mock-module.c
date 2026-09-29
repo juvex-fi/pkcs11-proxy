@@ -43,9 +43,125 @@ static CK_RV m_EncryptInit(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HA
 		CK_SALSA20_CHACHA20_POLY1305_PARAMS *p = m->pParameter;
 		if (!p || p->ulNonceLen != 12 || !p->pNonce || memcmp(p->pNonce, "chachanonce!", 12)) return CKR_MECHANISM_PARAM_INVALID;
 		if (p->ulAADLen != 4 || !p->pAAD || memcmp(p->pAAD, "adad", 4)) return CKR_MECHANISM_PARAM_INVALID;
+	} else if (m->mechanism == CKM_CHACHA20) {
+		CK_CHACHA20_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->blockCounterBits != 32 || !p->pBlockCounter || memcmp(p->pBlockCounter, "\1\2\3\4", 4)) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulNonceBits != 96 || !p->pNonce || memcmp(p->pNonce, "chachanonce!", 12)) return CKR_MECHANISM_PARAM_INVALID;
+	} else if (m->mechanism == CKM_SALSA20) {
+		CK_SALSA20_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p) return CKR_MECHANISM_PARAM_INVALID;
+		if (!p->pBlockCounter || memcmp(p->pBlockCounter, "counter8", 8)) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulNonceBits != 64 || !p->pNonce || memcmp(p->pNonce, "nonce-08", 8)) return CKR_MECHANISM_PARAM_INVALID;
+	} else if (m->mechanism == CKM_AES_CTS) {
+		if (m->ulParameterLen != 16 || !m->pParameter || memcmp(m->pParameter, "0123456789abcdef", 16)) return CKR_MECHANISM_PARAM_INVALID;
+	} else if (m->mechanism == CKM_DES_CFB8) {
+		if (m->ulParameterLen != 8 || !m->pParameter || memcmp(m->pParameter, "01234567", 8)) return CKR_MECHANISM_PARAM_INVALID;
 	} else
 		return CKR_MECHANISM_INVALID;
 	return CKR_OK;
+}
+
+/* ---- parameters of derive / sign / wrap mechanisms ---- */
+static CK_RV m_DeriveKey(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HANDLE base,
+	CK_ATTRIBUTE_PTR t, CK_ULONG n, CK_OBJECT_HANDLE_PTR key)
+{
+	CK_ULONG i;
+	*key = 99;
+	switch (m->mechanism) {
+	case CKM_ECDH1_DERIVE: {
+		CK_ECDH1_DERIVE_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p || p->kdf != CKD_NULL) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulSharedDataLen != 11 || !p->pSharedData || memcmp(p->pSharedData, "shared-data", 11)) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulPublicDataLen != 18 || !p->pPublicData || memcmp(p->pPublicData, "public-point-bytes", 18)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_ECDH1_COFACTOR_DERIVE: {
+		CK_ECDH1_DERIVE_PARAMS *p = m->pParameter;
+		if (!p || p->ulSharedDataLen != 0 || p->pSharedData != NULL) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulPublicDataLen != 4 || !p->pPublicData || memcmp(p->pPublicData, "abcd", 4)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_HKDF_DERIVE: {
+		CK_HKDF_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->bExtract != CK_TRUE || p->bExpand != CK_TRUE || p->prfHashMechanism != CKM_SHA256) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulSaltType != CKF_HKDF_SALT_DATA || p->ulSaltLen != 5 || !p->pSalt || memcmp(p->pSalt, "salt!", 5)) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulInfoLen != 9 || !p->pInfo || memcmp(p->pInfo, "info-info", 9)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_CONCATENATE_BASE_AND_DATA: {
+		CK_KEY_DERIVATION_STRING_DATA *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p || p->ulLen != 6 || !p->pData || memcmp(p->pData, "suffix", 6)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_AES_CBC_ENCRYPT_DATA: {
+		CK_AES_CBC_ENCRYPT_DATA_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p || p->length != 32 || !p->pData) return CKR_MECHANISM_PARAM_INVALID;
+		for (i = 0; i < 16; i++) if (p->iv[i] != 0x11) return CKR_MECHANISM_PARAM_INVALID;
+		for (i = 0; i < 32; i++) if (p->pData[i] != (CK_BYTE)(i * 5)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_DES_CBC_ENCRYPT_DATA: {
+		CK_DES_CBC_ENCRYPT_DATA_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p || p->length != 16 || !p->pData || memcmp(p->iv, "8bytesIV", 8)) return CKR_MECHANISM_PARAM_INVALID;
+		if (memcmp(p->pData, "0123456789abcdef", 16)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_DH_PKCS_DERIVE: {
+		CK_BYTE *p = m->pParameter;
+		if (!p || m->ulParameterLen != 300) return CKR_MECHANISM_PARAM_INVALID;
+		for (i = 0; i < 300; i++) if (p[i] != (CK_BYTE)(i * 3)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_CONCATENATE_BASE_AND_KEY:
+		if (!m->pParameter || m->ulParameterLen != sizeof(CK_OBJECT_HANDLE) || *(CK_OBJECT_HANDLE *)m->pParameter != 1234) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	case CKM_SHA256_KEY_DERIVATION:
+		return m->pParameter == NULL && m->ulParameterLen == 0 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	default:
+		return CKR_MECHANISM_INVALID;
+	}
+}
+
+static CK_RV m_SignInit(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HANDLE k)
+{
+	switch (m->mechanism) {
+	case CKM_EDDSA: {
+		CK_EDDSA_PARAMS *p = m->pParameter;
+		if (!p) return m->ulParameterLen == 0 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;   /* pure Ed25519 */
+		if (m->ulParameterLen != sizeof *p || p->phFlag != CK_TRUE || p->ulContextDataLen != 4 || !p->pContextData || memcmp(p->pContextData, "ctx!", 4)) return CKR_MECHANISM_PARAM_INVALID;
+		return CKR_OK;
+	}
+	case CKM_SHA256_HMAC_GENERAL:
+		return m->pParameter && m->ulParameterLen == sizeof(CK_ULONG) && *(CK_ULONG *)m->pParameter == 16 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	case CKM_ECDSA_SHA256: case CKM_ECDSA_SHA3_256: case CKM_DSA_SHA512:
+		return m->pParameter == NULL && m->ulParameterLen == 0 ? CKR_OK : CKR_MECHANISM_PARAM_INVALID;
+	default:
+		return CKR_MECHANISM_INVALID;
+	}
+}
+
+static CK_RV m_WrapKey(CK_SESSION_HANDLE s, CK_MECHANISM_PTR m, CK_OBJECT_HANDLE wk, CK_OBJECT_HANDLE k, CK_BYTE_PTR out, CK_ULONG_PTR ol)
+{
+	if (m->mechanism == CKM_RSA_AES_KEY_WRAP) {
+		CK_RSA_AES_KEY_WRAP_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p || p->ulAESKeyBits != 256 || !p->pOAEPParams) return CKR_MECHANISM_PARAM_INVALID;
+		CK_RSA_PKCS_OAEP_PARAMS *o = p->pOAEPParams;
+		if (o->hashAlg != CKM_SHA256 || o->mgf != CKG_MGF1_SHA256 || o->source != CKZ_DATA_SPECIFIED) return CKR_MECHANISM_PARAM_INVALID;
+		if (o->ulSourceDataLen != 3 || !o->pSourceData || memcmp(o->pSourceData, "lbl", 3)) return CKR_MECHANISM_PARAM_INVALID;
+		if (out && *ol >= 4) { memcpy(out, "WRAP", 4); }
+		*ol = 4;
+		return CKR_OK;
+	}
+	if (m->mechanism == CKM_ECDH_AES_KEY_WRAP) {
+		CK_ECDH_AES_KEY_WRAP_PARAMS *p = m->pParameter;
+		if (!p || m->ulParameterLen != sizeof *p || p->ulAESKeyBits != 256 || p->kdf != CKD_NULL) return CKR_MECHANISM_PARAM_INVALID;
+		if (p->ulSharedDataLen != 4 || !p->pSharedData || memcmp(p->pSharedData, "shar", 4)) return CKR_MECHANISM_PARAM_INVALID;
+		*ol = 0;
+		return CKR_OK;
+	}
+	return CKR_MECHANISM_INVALID;
 }
 
 /* ---- message-based encryption ---- */
@@ -213,6 +329,7 @@ static CK_FUNCTION_LIST list2 = {
 	.C_GetSlotList = m_GetSlotList,
 	.C_OpenSession = m_OpenSession, .C_CloseSession = m_CloseSession,
 	.C_EncryptInit = m_EncryptInit,
+	.C_DeriveKey = m_DeriveKey, .C_SignInit = m_SignInit, .C_WrapKey = m_WrapKey,
 };
 
 EXPORT CK_RV C_GetFunctionList(CK_FUNCTION_LIST_PTR_PTR l) { *l = &list2; return CKR_OK; }

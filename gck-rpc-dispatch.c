@@ -822,16 +822,20 @@ static CK_RV proto_read_mechanism(CallState * cs, CK_MECHANISM_PTR mech)
 		return CKR_OK;
 	}
 	if (gck_rpc_mechanism_has_sane_parameters(value)) {
-		if (!gck_rpc_mechanism_flat_param_len_ok(value, n_data) ||
-		    n_data > sizeof(cs->mech_flat))
+		if (!gck_rpc_mechanism_flat_param_len_ok(value, n_data))
 			return CKR_MECHANISM_PARAM_INVALID;
 		if (n_data == 0) {
 			mech->pParameter = NULL;
 			mech->ulParameterLen = 0;
 		} else {
 			/* aligned, private copy */
-			memcpy(&cs->mech_flat, data, n_data);
-			mech->pParameter = &cs->mech_flat;
+			void *copy = n_data <= sizeof(cs->mech_flat) ?
+				     (void *)&cs->mech_flat : call_alloc(cs, n_data);
+
+			if (copy == NULL)
+				return CKR_DEVICE_MEMORY;
+			memcpy(copy, data, n_data);
+			mech->pParameter = copy;
 		}
 		return CKR_OK;
 	}

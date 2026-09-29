@@ -414,19 +414,30 @@ int gck_rpc_mechanism_context_kind(CK_MECHANISM_TYPE mech);
 #define GCK_RPC_PHASE_DEC	4	/* C_Decrypt<Message*> parameter */
 #define GCK_RPC_PARAM_MAX_BUF	65536
 #define GCK_RPC_MSGPARAM_BLOB	2400	/* stack blob for message params */
-#define GCK_RPC_PARAM_MAX_FIELDS 8
+#define GCK_RPC_PARAM_MAX_FIELDS 10
+#define GCK_RPC_PARAM_MAX_DEPTH	2	/* a structure, and one it points to */
+
+/* Kinds of structure member */
+#define GCK_RPC_F_ULONG		0	/* CK_ULONG (or a handle, type, ...) */
+#define GCK_RPC_F_BUF		1	/* CK_BYTE_PTR, its length in another member */
+#define GCK_RPC_F_BBOOL		2	/* CK_BBOOL */
+#define GCK_RPC_F_INLINE	3	/* CK_BYTE array[n] inside the structure */
+#define GCK_RPC_F_STRUCT	4	/* pointer to another described structure */
+
+struct GckRpcParamDesc;
 
 typedef struct {
-	int is_buf;		/* 0: CK_ULONG field, 1: CK_BYTE_PTR field */
+	int type;		/* GCK_RPC_F_* */
 	size_t off;		/* offset in the CK_* structure */
-	int len_idx;		/* buf: index of the field giving its length */
-	int len_bits;		/* buf: that field counts bits */
-	size_t len_fixed;	/* buf: fixed length (when len_idx < 0) */
-	int req;		/* buf: phases in which its bytes are sent */
+	int len_idx;		/* buf: index of the member giving its length */
+	int len_bits;		/* buf: that member counts bits */
+	size_t len_fixed;	/* buf (len_idx < 0) / inline: length in bytes */
+	int req;		/* phases in which the bytes are sent */
 	int resp;		/* buf: returned after an encrypt-message call */
+	const struct GckRpcParamDesc *sub;	/* struct: what it points to */
 } GckRpcParamField;
 
-typedef struct {
+typedef struct GckRpcParamDesc {
 	int kind;
 	int phases;		/* phases this structure may be used in */
 	size_t size;		/* sizeof the CK_* structure */
@@ -444,6 +455,16 @@ typedef struct {
 		CK_SALSA20_CHACHA20_POLY1305_PARAMS chacha;
 		CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS chacha_msg;
 		CK_RSA_PKCS_OAEP_PARAMS oaep;
+		CK_ECDH1_DERIVE_PARAMS ecdh1;
+		CK_ECDH_AES_KEY_WRAP_PARAMS ecdh_wrap;
+		CK_HKDF_PARAMS hkdf;
+		CK_EDDSA_PARAMS eddsa;
+		CK_CHACHA20_PARAMS chacha20;
+		CK_SALSA20_PARAMS salsa20;
+		CK_KEY_DERIVATION_STRING_DATA strdata;
+		CK_AES_CBC_ENCRYPT_DATA_PARAMS aes_cbc_data;
+		CK_DES_CBC_ENCRYPT_DATA_PARAMS des_cbc_data;
+		CK_RSA_AES_KEY_WRAP_PARAMS rsa_aes_wrap;
 	} s;
 	size_t lens[GCK_RPC_PARAM_MAX_FIELDS];
 } GckRpcParamState;

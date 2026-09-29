@@ -19,12 +19,33 @@ PKCS#11 v3.2
 ============
 
 Built against the OASIS v3.2 headers by default (``-DPKCS11_V32=ON``). All
-104 functions are proxied, ``C_GetInterface``/``C_GetInterfaceList`` are
-exported, and the post-quantum mechanisms (ML-KEM, ML-DSA, SLH-DSA, HSS, XMSS)
-work, including the optional signing context. AES-GCM, AES-CCM and
-ChaCha20-Poly1305 are supported both as single-part mechanisms and in the
-message-based API; their parameter structures are serialized field by field,
-so no client pointer reaches the module in the daemon.
+104 functions are proxied. ``C_GetInterface``/``C_GetInterfaceList`` are
+exported and offer the 3.2, 3.1, 3.0 and 2.40 interfaces, each matched by its
+exact version.
+
+The daemon is the trust boundary: it applies the mechanism allow-list and
+parameter checks itself, and never hands the module a pointer received from a
+client. Mechanism parameters and attribute templates that contain pointers are
+serialized field by field and rebuilt in the daemon's memory.
+
+Supported mechanisms (about 350 of the 470 names in the header):
+
+- everything without a parameter, digests, HMACs and key generation/derivation
+  (SHA-2, SHA-3, BLAKE2b, ...), RSA/ECDSA/DSA with hashes, EdDSA
+- post-quantum: ML-KEM, ML-DSA, SLH-DSA, HSS and XMSS, including the optional
+  signing context
+- structures with pointers: AES-GCM/CCM and ChaCha20/Salsa20-Poly1305 (also
+  in the message-based API), RSA-OAEP, RSA-AES key wrap, ECDH derive and
+  ECDH-AES wrap, HKDF, EdDSA context, ChaCha20/Salsa20, key derivation from
+  data, ``*_ENCRYPT_DATA``
+- flat parameters: RSA-PSS, IVs, AES-CTR, key wrap, general-length MACs, ...
+
+Not supported (refused, and left out of ``C_GetMechanismList``): the
+protocol-specific mechanisms that return values through their parameter or
+carry arrays of structures (TLS/SSL/WTLS/IKE PRF and key derivation, X3DH,
+X2Ratchet, SP800-108 KDFs, PKCS5-PBKDF2, PBE), plus obsolete ones (Skipjack,
+Baton, Juniper, KEA, GOST, SecurID/HOTP/ACTI, RC5 CBC, ECMQV, X9.42 DH, AES-XTS
+and the SHA512/t family).
 
 Tests
 =====
@@ -33,9 +54,11 @@ Tests
 
   cmake -B build -DPKCS11_TESTS=ON && cmake --build build && (cd build && ctest)
 
-This runs a fuzzer for the daemon's parameter parser and an end-to-end test of
-the message-based, single-part AEAD and async functions against a mock module.
-To also test ML-KEM/ML-DSA through the proxy, pass a SoftHSM built with them::
+This runs a fuzzer for the daemon's parsers, tests that feed the daemon hostile
+input, and end-to-end tests of the message-based and single-part AEAD, async,
+mechanism-parameter and interface functions against a mock module. To also
+test against a real module (ML-KEM/ML-DSA, attribute templates, OAEP, PSS,
+GCM, ECDSA, ECDH, EdDSA), pass a SoftHSM built with ML-DSA and ML-KEM::
 
   -DPKCS11_TEST_SOFTHSM_MODULE=/path/to/libsofthsm2.so \
   -DPKCS11_TEST_SOFTHSM_UTIL=/path/to/softhsm2-util

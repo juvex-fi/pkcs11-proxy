@@ -65,7 +65,7 @@ static void test_mechanisms(void)
 	memset(raw, 0x41, sizeof raw);
 
 	/* a mechanism the proxy doesn't handle: refused whatever it carries */
-	fresh(); add_mechanism(CKM_ECDH1_DERIVE, raw, 40);
+	fresh(); add_mechanism(CKM_TLS12_MASTER_KEY_DERIVE, raw, 40);
 	CHECK(read_mech(&m) == CKR_MECHANISM_INVALID, "unsupported mechanism must be refused");
 	fresh(); add_mechanism(0x7fffff01UL, raw, 8);
 	CHECK(read_mech(&m) == CKR_MECHANISM_INVALID, "unknown mechanism must be refused");
@@ -131,6 +131,102 @@ static void test_mechanisms(void)
 	CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "raw GCM parameter refused");
 	fresh(); add_mechanism(CKM_AES_CCM, raw, sizeof(CK_CCM_PARAMS));
 	CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "raw CCM parameter refused");
+
+	/* pointer-carrying derive/sign/wrap parameters: never the client's raw struct */
+	{
+		CK_ECDH1_DERIVE_PARAMS forged;
+		memset(&forged, 0, sizeof forged);
+		forged.kdf = CKD_NULL; forged.ulPublicDataLen = 16;
+		forged.pPublicData = (void *)0x4141414141414141UL;
+		fresh(); add_mechanism(CKM_ECDH1_DERIVE, &forged, sizeof forged);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "raw ECDH1 parameter (forged pointer) refused");
+		CK_HKDF_PARAMS hp; memset(&hp, 0, sizeof hp);
+		fresh(); add_mechanism(CKM_HKDF_DERIVE, &hp, sizeof hp);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "raw HKDF parameter refused");
+		CK_EDDSA_PARAMS ep; memset(&ep, 0, sizeof ep); ep.pContextData = (void *)0x4242424242424242UL; ep.ulContextDataLen = 4;
+		fresh(); add_mechanism(CKM_EDDSA, &ep, sizeof ep);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "raw EDDSA parameter refused");
+		CK_RSA_AES_KEY_WRAP_PARAMS wp = { 256, (void *)0x4343434343434343UL };
+		fresh(); add_mechanism(CKM_RSA_AES_KEY_WRAP, &wp, sizeof wp);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "raw RSA-AES wrap parameter (nested pointer) refused");
+		CK_AES_CBC_ENCRYPT_DATA_PARAMS cd; memset(&cd, 0, sizeof cd); cd.pData = (void *)0x4444444444444444UL; cd.length = 16;
+		fresh(); add_mechanism(CKM_AES_CBC_ENCRYPT_DATA, &cd, sizeof cd);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "raw AES-CBC-ENCRYPT-DATA parameter refused");
+	}
+	/* a well-formed blob of the wrong kind for the mechanism */
+	{
+		unsigned char blob[600]; size_t n;
+		static unsigned char salt[] = "salt!";
+		CK_HKDF_PARAMS hp = { CK_TRUE, CK_TRUE, CKM_SHA256, CKF_HKDF_SALT_DATA, salt, 5, 0, (CK_BYTE_PTR)"i", 1 };
+		CK_HKDF_PARAMS *got;
+		CHECK(gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_HKDF_DERIVE), &hp,
+					   GCK_RPC_PHASE_MECH, blob, sizeof blob, &n) == CKR_OK, "encode HKDF");
+		fresh(); add_mechanism(CKM_ECDH1_DERIVE, blob, n);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "HKDF blob for an ECDH mechanism refused");
+		fresh(); add_mechanism(CKM_HKDF_DERIVE, blob, n);
+		rv = read_mech(&m);
+		got = m.pParameter;
+		CHECK(rv == CKR_OK && got && got->bExtract == CK_TRUE && got->ulSaltLen == 5 &&
+		      got->pSalt != salt && memcmp(got->pSalt, "salt!", 5) == 0 &&
+		      got->ulInfoLen == 1 && got->pInfo[0] == 'i', "HKDF blob rebuilt in daemon memory");
+		fresh(); add_mechanism(CKM_HKDF_DERIVE, blob, n - 2);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "truncated HKDF blob refused");
+	}
+	/* nested structure: RSA-AES key wrap points at OAEP parameters */
+	{
+		unsigned char label[] = "lbl", blob[600]; size_t n;
+		CK_RSA_PKCS_OAEP_PARAMS o = { CKM_SHA256, CKG_MGF1_SHA256, CKZ_DATA_SPECIFIED, label, 3 };
+		CK_RSA_AES_KEY_WRAP_PARAMS w = { 256, &o }, *got;
+		CHECK(gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_RSA_AES_KEY_WRAP), &w,
+					   GCK_RPC_PHASE_MECH, blob, sizeof blob, &n) == CKR_OK, "encode RSA-AES wrap");
+		fresh(); add_mechanism(CKM_RSA_AES_KEY_WRAP, blob, n);
+		rv = read_mech(&m);
+		got = m.pParameter;
+		CHECK(rv == CKR_OK && got && got->pOAEPParams && got->pOAEPParams != &o &&
+		      got->pOAEPParams->pSourceData != (void *)label && got->pOAEPParams->ulSourceDataLen == 3 &&
+		      memcmp(got->pOAEPParams->pSourceData, "lbl", 3) == 0, "nested OAEP structure rebuilt in daemon memory");
+		fresh(); add_mechanism(CKM_RSA_AES_KEY_WRAP, blob, n - 1);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "truncated nested structure refused");
+		/* the "present" byte says there is a nested structure but there is none */
+		fresh(); add_mechanism(CKM_RSA_AES_KEY_WRAP, blob, 1 + 8 + 1);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "nested structure announced but missing");
+	}
+	/* the extended flat families */
+	fresh(); add_mechanism(CKM_SHA256_HMAC_GENERAL, raw, 4);
+	CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "short general-MAC length");
+	fresh(); add_mechanism(CKM_SHA256_HMAC_GENERAL, raw, sizeof(CK_ULONG));
+	CHECK(read_mech(&m) == CKR_OK, "general-MAC length accepted");
+	fresh(); add_mechanism(CKM_AES_CTS, raw, 16);
+	CHECK(read_mech(&m) == CKR_OK, "AES-CTS IV accepted");
+	fresh(); add_mechanism(CKM_AES_CTS, raw, 8);
+	CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "8-byte AES-CTS IV");
+	fresh(); add_mechanism(CKM_DH_PKCS_DERIVE, raw, 200);
+	rv = read_mech(&m);
+	CHECK(rv == CKR_OK && m.ulParameterLen == 200 && memcmp(m.pParameter, raw, 200) == 0, "DH public value copied");
+	{
+		unsigned char *huge = calloc(1, 5000);
+		fresh(); add_mechanism(CKM_DH_PKCS_DERIVE, huge, 5000);
+		CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "DH public value over the limit");
+		free(huge);
+	}
+	/* legacy mechanisms that used to lose their parameter */
+	fresh(); add_mechanism(CKM_RC2_ECB, raw, sizeof(CK_ULONG));
+	rv = read_mech(&m);
+	CHECK(rv == CKR_OK && m.ulParameterLen == sizeof(CK_ULONG), "RC2-ECB effective-bits parameter kept");
+	fresh(); add_mechanism(CKM_RC2_ECB, raw, 3);
+	CHECK(read_mech(&m) == CKR_MECHANISM_PARAM_INVALID, "short RC2-ECB parameter");
+	fresh(); add_mechanism(CKM_RC5_MAC, raw, sizeof(CK_RC5_PARAMS));
+	CHECK(read_mech(&m) == CKR_OK, "RC5 parameters kept");
+	fresh(); add_mechanism(CKM_TLS_PRE_MASTER_KEY_GEN, raw, sizeof(CK_VERSION));
+	rv = read_mech(&m);
+	CHECK(rv == CKR_OK && m.ulParameterLen == sizeof(CK_VERSION), "pre-master version kept");
+	fresh(); add_mechanism(CKM_SHA1_KEY_DERIVATION, raw, 8);
+	rv = read_mech(&m);
+	CHECK(rv == CKR_OK && m.pParameter == NULL, "SHA-1 key derivation takes no parameter");
+
+	fresh(); add_mechanism(CKM_ECDSA_SHA256, raw, 64);
+	rv = read_mech(&m);
+	CHECK(rv == CKR_OK && m.pParameter == NULL, "no parameter for ECDSA-SHA256");
 
 	/* signing context: bad sizes */
 	{

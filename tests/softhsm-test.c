@@ -215,6 +215,128 @@ static void test_rsa(void)
 	RV("PSS with a short parameter", f->C_SignInit(s, &bad, prv), CKR_MECHANISM_PARAM_INVALID);
 }
 
+static int have(CK_MECHANISM_TYPE m)
+{
+	CK_MECHANISM_INFO mi;
+	CK_SLOT_ID slots[4]; CK_ULONG ns = 4;
+	f->C_GetSlotList(CK_TRUE, slots, &ns);
+	return f->C_GetMechanismInfo(slots[0], m, &mi) == CKR_OK;
+}
+
+static CK_OBJECT_HANDLE derive_secret(CK_OBJECT_HANDLE base, CK_BYTE_PTR pub, CK_ULONG publen, CK_RV *rv)
+{
+	CK_ECDH1_DERIVE_PARAMS p = { CKD_NULL, 0, NULL, publen, pub };
+	CK_MECHANISM m = { CKM_ECDH1_DERIVE, &p, sizeof p };
+	CK_OBJECT_CLASS sk = CKO_SECRET_KEY; CK_KEY_TYPE gt = CKK_GENERIC_SECRET;
+	CK_ULONG len = 32; CK_BBOOL T = CK_TRUE, F = CK_FALSE;
+	CK_ATTRIBUTE t[] = { {CKA_CLASS, &sk, sizeof sk}, {CKA_KEY_TYPE, &gt, sizeof gt}, {CKA_VALUE_LEN, &len, sizeof len},
+			     {CKA_TOKEN, &F, 1}, {CKA_SENSITIVE, &F, 1}, {CKA_EXTRACTABLE, &T, 1} };
+	CK_OBJECT_HANDLE k = 0;
+	*rv = f->C_DeriveKey(s, &m, base, t, 6, &k);
+	return k;
+}
+
+static void ec_pair(CK_MECHANISM_TYPE gen, const CK_BYTE *params, CK_ULONG plen, CK_OBJECT_HANDLE *pub, CK_OBJECT_HANDLE *prv, CK_RV *rv)
+{
+	CK_BBOOL T = CK_TRUE, F = CK_FALSE;
+	CK_ATTRIBUTE pt[] = { {CKA_EC_PARAMS, (void *)params, plen}, {CKA_VERIFY, &T, 1}, {CKA_TOKEN, &F, 1} };
+	CK_ATTRIBUTE vt[] = { {CKA_SIGN, &T, 1}, {CKA_DERIVE, &T, 1}, {CKA_TOKEN, &F, 1} };
+	CK_MECHANISM m = { gen, NULL, 0 };
+	*rv = f->C_GenerateKeyPair(s, &m, pt, 3, vt, 3, pub, prv);
+}
+
+static void test_ec(void)
+{
+	static const CK_BYTE p256[] = { 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+	CK_OBJECT_HANDLE pa, va, pb, vb;
+	CK_RV rv;
+	CK_BYTE msg[40], sig[128];
+	CK_ULONG sl;
+	for (int i = 0; i < 40; i++) msg[i] = (CK_BYTE)(i + 9);
+
+	ec_pair(CKM_EC_KEY_PAIR_GEN, p256, sizeof p256, &pa, &va, &rv);
+	RV("EC P-256 keygen (A)", rv, CKR_OK);
+	ec_pair(CKM_EC_KEY_PAIR_GEN, p256, sizeof p256, &pb, &vb, &rv);
+	RV("EC P-256 keygen (B)", rv, CKR_OK);
+	if (rv != CKR_OK) return;
+
+	/* ECDSA with a hash: a mechanism the proxy used to hide */
+	if (have(CKM_ECDSA_SHA256)) {
+		CK_MECHANISM m = { CKM_ECDSA_SHA256, NULL, 0 };
+		RV("ECDSA_SHA256 SignInit", f->C_SignInit(s, &m, va), CKR_OK);
+		sl = sizeof sig;
+		RV("ECDSA_SHA256 Sign", f->C_Sign(s, msg, 40, sig, &sl), CKR_OK);
+		RV("ECDSA_SHA256 VerifyInit", f->C_VerifyInit(s, &m, pa), CKR_OK);
+		RV("ECDSA_SHA256 Verify", f->C_Verify(s, msg, 40, sig, sl), CKR_OK);
+		msg[0] ^= 1;
+		RV("ECDSA_SHA256 VerifyInit", f->C_VerifyInit(s, &m, pa), CKR_OK);
+		rv = f->C_Verify(s, msg, 40, sig, sl);
+		CHECK(rv == CKR_SIGNATURE_INVALID, "tampered message rejected (0x%lx)", (unsigned long)rv);
+		msg[0] ^= 1;
+	} else printf("skip: ECDSA_SHA256 not offered by the module\n");
+
+	/* ECDH: both sides must derive the same secret from the other's public point */
+	if (have(CKM_ECDH1_DERIVE)) {
+		CK_BYTE pta[128], ptb[128];
+		CK_ATTRIBUTE ga = { CKA_EC_POINT, pta, sizeof pta }, gb = { CKA_EC_POINT, ptb, sizeof ptb };
+		RV("read A's EC point", f->C_GetAttributeValue(s, pa, &ga, 1), CKR_OK);
+		RV("read B's EC point", f->C_GetAttributeValue(s, pb, &gb, 1), CKR_OK);
+		CK_RV r1, r2;
+		CK_OBJECT_HANDLE k1 = derive_secret(va, ptb, gb.ulValueLen, &r1);
+		CK_OBJECT_HANDLE k2 = derive_secret(vb, pta, ga.ulValueLen, &r2);
+		if (r1 != CKR_OK || r2 != CKR_OK) {
+			/* some modules want the raw point rather than the DER OCTET STRING */
+			k1 = derive_secret(va, ptb + 2, gb.ulValueLen - 2, &r1);
+			k2 = derive_secret(vb, pta + 2, ga.ulValueLen - 2, &r2);
+		}
+		RV("ECDH1_DERIVE (A with B's point)", r1, CKR_OK);
+		RV("ECDH1_DERIVE (B with A's point)", r2, CKR_OK);
+		if (r1 == CKR_OK && r2 == CKR_OK) {
+			CK_BYTE v1[64], v2[64];
+			CK_ATTRIBUTE g1 = { CKA_VALUE, v1, sizeof v1 }, g2 = { CKA_VALUE, v2, sizeof v2 };
+			f->C_GetAttributeValue(s, k1, &g1, 1); f->C_GetAttributeValue(s, k2, &g2, 1);
+			CHECK(g1.ulValueLen == 32 && g1.ulValueLen == g2.ulValueLen && memcmp(v1, v2, 32) == 0,
+			      "both sides derived the same 32-byte secret");
+		}
+		/* the public point crossed the wire as data, not as a pointer */
+		CK_BYTE junk[65]; memset(junk, 0x41, sizeof junk);
+		derive_secret(va, junk, sizeof junk, &rv);
+		CHECK(rv != CKR_OK, "garbage public point rejected by the module (0x%lx)", (unsigned long)rv);
+	} else printf("skip: ECDH1_DERIVE not offered by the module\n");
+
+	/* EdDSA */
+	if (have(CKM_EDDSA) && have(CKM_EC_EDWARDS_KEY_PAIR_GEN)) {
+		static const CK_BYTE ed25519[] = { 0x06, 0x03, 0x2b, 0x65, 0x70 };
+		CK_OBJECT_HANDLE ep, ev;
+		ec_pair(CKM_EC_EDWARDS_KEY_PAIR_GEN, ed25519, sizeof ed25519, &ep, &ev, &rv);
+		RV("Ed25519 keygen", rv, CKR_OK);
+		if (rv == CKR_OK) {
+			CK_MECHANISM m = { CKM_EDDSA, NULL, 0 };
+			RV("EDDSA SignInit", f->C_SignInit(s, &m, ev), CKR_OK);
+			sl = sizeof sig;
+			RV("EDDSA Sign", f->C_Sign(s, msg, 40, sig, &sl), CKR_OK);
+			CHECK(sl == 64, "Ed25519 signature is 64 bytes (%lu)", (unsigned long)sl);
+			RV("EDDSA VerifyInit", f->C_VerifyInit(s, &m, ep), CKR_OK);
+			RV("EDDSA Verify", f->C_Verify(s, msg, 40, sig, sl), CKR_OK);
+		}
+	} else printf("skip: EdDSA not offered by the module\n");
+
+	/* general-length HMAC: the parameter is the MAC length */
+	if (have(CKM_SHA256_HMAC_GENERAL) && have(CKM_GENERIC_SECRET_KEY_GEN)) {
+		CK_ULONG klen = 32; CK_BBOOL T = CK_TRUE, F = CK_FALSE;
+		CK_ATTRIBUTE kt[] = { {CKA_VALUE_LEN, &klen, sizeof klen}, {CKA_SIGN, &T, 1}, {CKA_VERIFY, &T, 1}, {CKA_TOKEN, &F, 1} };
+		CK_MECHANISM kg = { CKM_GENERIC_SECRET_KEY_GEN, NULL, 0 };
+		CK_OBJECT_HANDLE hk;
+		RV("generic secret keygen", f->C_GenerateKey(s, &kg, kt, 4, &hk), CKR_OK);
+		CK_ULONG macbits = 12;
+		CK_MECHANISM hm = { CKM_SHA256_HMAC_GENERAL, &macbits, sizeof macbits };
+		RV("SHA256_HMAC_GENERAL SignInit", f->C_SignInit(s, &hm, hk), CKR_OK);
+		sl = sizeof sig;
+		RV("SHA256_HMAC_GENERAL Sign", f->C_Sign(s, msg, 40, sig, &sl), CKR_OK);
+		CHECK(sl == 12, "MAC has the requested length (%lu)", (unsigned long)sl);
+	} else printf("skip: SHA256_HMAC_GENERAL not offered by the module\n");
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -233,6 +355,7 @@ int main(int argc, char **argv)
 	test_templates();
 	test_aes();
 	test_rsa();
+	test_ec();
 
 	f->C_Finalize(NULL);
 	printf("\n%d failure(s)\n", fails);

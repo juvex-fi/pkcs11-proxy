@@ -13,8 +13,40 @@
 
 void gck_rpc_log(const char *m, ...) { (void)m; }
 
-static unsigned char *last_work; static size_t last_len;
-static void *al(void *ctx, size_t n) { last_work = malloc(n); last_len = n; return last_work; }
+/* every block the decoder allocates, so pointers can be checked against them */
+static struct { unsigned char *p; size_t n; } blocks[64]; static int nblocks;
+static void *al(void *ctx, size_t n)
+{
+	(void)ctx;
+	if (nblocks >= 64) return NULL;
+	blocks[nblocks].p = malloc(n ? n : 1); blocks[nblocks].n = n ? n : 1;
+	return blocks[nblocks++].p;
+}
+static void free_blocks(void) { while (nblocks) free(blocks[--nblocks].p); }
+static int inside(const unsigned char *p, size_t n)
+{
+	for (int i = 0; i < nblocks; i++)
+		if (p >= blocks[i].p && p + n <= blocks[i].p + blocks[i].n) return 1;
+	return 0;
+}
+/* walk every buffer pointer of a decoded structure (and structures it points to) */
+static int check_ptrs(const GckRpcParamDesc *d, const unsigned char *base, const size_t *lens)
+{
+	for (int i = 0; i < d->nfields; i++) {
+		const GckRpcParamField *f = &d->fields[i];
+		if (f->type == GCK_RPC_F_BUF) {
+			unsigned char *p; memcpy(&p, base + f->off, sizeof p);
+			if (!lens) continue;
+			if (lens[i] == 0) { if (p) return 0; continue; }
+			if (!inside(p, lens[i])) return 0;
+			volatile unsigned char x = p[0]; x = p[lens[i] - 1]; (void)x;
+		} else if (f->type == GCK_RPC_F_STRUCT) {
+			const unsigned char *sub; memcpy(&sub, base + f->off, sizeof sub);
+			if (sub) { if (!inside(sub, f->sub->size)) return 0; if (!check_ptrs(f->sub, sub, NULL)) return 0; }
+		}
+	}
+	return 1;
+}
 
 static void *tptrs[512]; static long ntpl;
 static void *tal(void *ctx, size_t n) { (void)ctx; if (ntpl >= 512) return NULL; return tptrs[ntpl++] = malloc(n ? n : 1); }
@@ -37,30 +69,21 @@ int main(int argc, char **argv)
 			if (rnd() & 1) { memset(blob + i, 0, 7); blob[i + 7] = (unsigned char)(rnd() % 40); }
 		int phase = 1 << (rnd() % 3);
 		GckRpcParamState st;
-		last_work = NULL;
+		nblocks = 0;
 		CK_RV rv = gck_rpc_param_decode(blob, n, phase, &st, al, NULL);
 		if (rv == CKR_OK) {
 			ok++;
-			/* every pointer must lie inside the private work buffer */
-			const GckRpcParamDesc *d = st.desc;
-			for (int i = 0; i < d->nfields; i++) {
-				if (!d->fields[i].is_buf) continue;
-				unsigned char *p; memcpy(&p, (char *)&st.s + d->fields[i].off, sizeof p);
-				if (st.lens[i] == 0) { if (p) { printf("non-NULL empty ptr\n"); return 1; } continue; }
-				if (p < last_work || p + st.lens[i] > last_work + last_len) { printf("pointer escapes work buffer!\n"); return 1; }
-				volatile unsigned char x = p[0]; x = p[st.lens[i] - 1]; (void)x;   /* touch under ASAN */
-			}
+			if (!check_ptrs(st.desc, (const unsigned char *)&st.s, st.lens)) { printf("pointer escapes the daemon's buffers!\n"); return 1; }
 			unsigned char rb[GCK_RPC_MSGPARAM_BLOB]; size_t rn;
 			gck_rpc_param_resp_encode(&st, rb, sizeof rb, &rn);
 		} else rej++;
-		free(last_work);
+		free_blocks();
 	}
-
 	/* mutate blobs produced by the real encoder */
 	long mok = 0, mrej = 0;
 	for (long it = 0; it < n_it; it++) {
 		CK_BYTE a[40], b[40];
-		int k = rnd() % 6;
+		int k = rnd() % 15;
 		unsigned char enc[600]; size_t en = 0;
 		memset(a, 1, sizeof a); memset(b, 2, sizeof b);
 		CK_GCM_MESSAGE_PARAMS g = { a, 12, 32, 3, b, 128 };
@@ -77,26 +100,28 @@ int main(int argc, char **argv)
 		case 2: rv = gck_rpc_param_encode(gck_rpc_param_desc_for_message(sizeof h), &h, phase, enc, sizeof enc, &en); break;
 		case 3: phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_AES_GCM), &gp, phase, enc, sizeof enc, &en); break;
 		case 4: phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_AES_CCM), &cp, phase, enc, sizeof enc, &en); break;
-		default: phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_CHACHA20_POLY1305), &hp, phase, enc, sizeof enc, &en); break;
+		case 5: phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_CHACHA20_POLY1305), &hp, phase, enc, sizeof enc, &en); break;
+		case 6: { CK_ECDH1_DERIVE_PARAMS x = { 1, 12, a, 20, b }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_ECDH1_DERIVE), &x, phase, enc, sizeof enc, &en); break; }
+		case 7: { CK_HKDF_PARAMS x = { 1, 1, 2, 3, a, 9, 0, b, 11 }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_HKDF_DERIVE), &x, phase, enc, sizeof enc, &en); break; }
+		case 8: { CK_EDDSA_PARAMS x = { 1, 6, a }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_EDDSA), &x, phase, enc, sizeof enc, &en); break; }
+		case 9: { CK_CHACHA20_PARAMS x = { a, 32, b, 96 }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_CHACHA20), &x, phase, enc, sizeof enc, &en); break; }
+		case 10: { CK_SALSA20_PARAMS x = { a, b, 64 }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_SALSA20), &x, phase, enc, sizeof enc, &en); break; }
+		case 11: { CK_KEY_DERIVATION_STRING_DATA x = { a, 17 }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_CONCATENATE_BASE_AND_DATA), &x, phase, enc, sizeof enc, &en); break; }
+		case 12: { CK_AES_CBC_ENCRYPT_DATA_PARAMS x; memset(x.iv, 7, 16); x.pData = a; x.length = 21; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_AES_CBC_ENCRYPT_DATA), &x, phase, enc, sizeof enc, &en); break; }
+		case 13: { CK_RSA_PKCS_OAEP_PARAMS o = { 1, 2, 3, a, 10 }; CK_RSA_AES_KEY_WRAP_PARAMS x = { 256, &o }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_RSA_AES_KEY_WRAP), &x, phase, enc, sizeof enc, &en); break; }
+		default: { CK_RSA_AES_KEY_WRAP_PARAMS x = { 128, NULL }; phase = 1; rv = gck_rpc_param_encode(gck_rpc_param_desc_for_mechanism(CKM_RSA_AES_KEY_WRAP), &x, phase, enc, sizeof enc, &en); break; }
 		}
 		if (rv != CKR_OK) { printf("encode failed %d 0x%lx\n", k, (unsigned long)rv); return 1; }
 		int nmut = rnd() % 4;
 		for (int m = 0; m < nmut; m++) enc[rnd() % en] = (unsigned char)rnd();
 		size_t n = en; if (rnd() % 4 == 0) n = rnd() % (en + 1);
-		GckRpcParamState st; last_work = NULL;
+		GckRpcParamState st; nblocks = 0;
 		rv = gck_rpc_param_decode(enc, n, phase, &st, al, NULL);
 		if (rv == CKR_OK) {
 			mok++;
-			const GckRpcParamDesc *dd = st.desc;
-			for (int i = 0; i < dd->nfields; i++) {
-				if (!dd->fields[i].is_buf) continue;
-				unsigned char *p; memcpy(&p, (char *)&st.s + dd->fields[i].off, sizeof p);
-				if (st.lens[i] == 0) continue;
-				if (p < last_work || p + st.lens[i] > last_work + last_len) { printf("pointer escapes work buffer!\n"); return 1; }
-				volatile unsigned char x = p[0]; x = p[st.lens[i] - 1]; (void)x;
-			}
+			if (!check_ptrs(st.desc, (const unsigned char *)&st.s, st.lens)) { printf("pointer escapes the daemon's buffers!\n"); return 1; }
 		} else mrej++;
-		free(last_work);
+		free_blocks();
 	}
 	/* round trip: what the client encodes, the daemon decodes to the same fields */
 	{
@@ -105,7 +130,7 @@ int main(int argc, char **argv)
 		CK_GCM_MESSAGE_PARAMS g = { a, 12, 32, 3, b, 128 };
 		unsigned char enc[600]; size_t en; GckRpcParamState st;
 		gck_rpc_param_encode(gck_rpc_param_desc_for_message(sizeof g), &g, GCK_RPC_PHASE_DEC, enc, sizeof enc, &en);
-		CK_RV rv = gck_rpc_param_decode(enc, en, GCK_RPC_PHASE_DEC, &st, al, NULL);
+		nblocks = 0; CK_RV rv = gck_rpc_param_decode(enc, en, GCK_RPC_PHASE_DEC, &st, al, NULL);
 		int good = rv == CKR_OK && st.s.gcm_msg.ulIvLen == 12 && st.s.gcm_msg.ulIvFixedBits == 32 &&
 			   st.s.gcm_msg.ivGenerator == 3 && st.s.gcm_msg.ulTagBits == 128 &&
 			   memcmp(st.s.gcm_msg.pIv, a, 12) == 0 && memcmp(st.s.gcm_msg.pTag, b, 16) == 0 &&
