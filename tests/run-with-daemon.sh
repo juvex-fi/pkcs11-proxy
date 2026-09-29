@@ -31,7 +31,10 @@ fi
 port=$((20000 + $$ % 20000))
 addr="tcp://127.0.0.1:$port"
 
-PKCS11_DAEMON_SOCKET=$addr "$daemon" "$module" > "$work/daemon.log" 2>&1 &
+# P11_TEST_DAEMON_ARGS adds daemon options, e.g. --no-seccomp where the kernel
+# or emulator can't load seccomp filters (such as amd64 emulation in Docker).
+# shellcheck disable=SC2086
+PKCS11_DAEMON_SOCKET=$addr "$daemon" "$module" ${P11_TEST_DAEMON_ARGS:-} > "$work/daemon.log" 2>&1 &
 daemon_pid=$!
 sleep 2
 kill -0 "$daemon_pid" 2>/dev/null || { echo "daemon failed to start:"; cat "$work/daemon.log"; exit 1; }
