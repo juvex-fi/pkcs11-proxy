@@ -16,6 +16,9 @@ void gck_rpc_log(const char *m, ...) { (void)m; }
 static unsigned char *last_work; static size_t last_len;
 static void *al(void *ctx, size_t n) { last_work = malloc(n); last_len = n; return last_work; }
 
+static void *tptrs[512]; static long ntpl;
+static void *tal(void *ctx, size_t n) { (void)ctx; if (ntpl >= 512) return NULL; return tptrs[ntpl++] = malloc(n ? n : 1); }
+
 static uint64_t rng = 88172645463325252ULL;
 static uint64_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
 
@@ -114,6 +117,53 @@ int main(int argc, char **argv)
 		       (unsigned long)CKR_MECHANISM_PARAM_INVALID);
 		if (rv != CKR_MECHANISM_PARAM_INVALID)
 			return 1;
+	}
+
+	/* ---- nested attribute templates ---- */
+	{
+		long tok = 0, trej = 0, tapply = 0;
+
+		for (long it = 0; it < n_it; it++) {
+			CK_ATTRIBUTE in[4];
+			CK_ULONG cnt = rnd() % 5, i;
+			unsigned char vals[4][40];
+			GckRpcTplBuf b;
+			int bufmode = rnd() & 1;
+
+			for (i = 0; i < cnt; i++) {
+				memset(vals[i], (int)i + 1, sizeof vals[i]);
+				in[i].type = CKA_LABEL + (rnd() % 8);
+				in[i].pValue = (rnd() % 5) ? vals[i] : NULL;
+				in[i].ulValueLen = (rnd() % 7 || bufmode) ? rnd() % 40 : (CK_ULONG)-1;
+			}
+			if (!gck_rpc_template_encode(&b, in, cnt, bufmode)) { printf("template encode failed\n"); return 1; }
+			int nmut = rnd() % 4;
+			for (int m = 0; m < nmut && b.len; m++) b.p[rnd() % b.len] = (unsigned char)rnd();
+			size_t n = b.len; if (rnd() % 4 == 0) n = rnd() % (b.len + 1);
+
+			CK_ATTRIBUTE_PTR out; CK_ULONG oc;
+			ntpl = 0;
+			CK_RV rv = gck_rpc_template_decode(b.p, n, bufmode, tal, NULL, &out, &oc);
+			if (rv == CKR_OK) {
+				tok++;
+				for (i = 0; i < oc; i++)   /* touch every value under ASan */
+					if (out[i].pValue && (CK_LONG)out[i].ulValueLen != -1) {
+						volatile unsigned char x = ((unsigned char *)out[i].pValue)[0];
+						if (out[i].ulValueLen) x = ((unsigned char *)out[i].pValue)[out[i].ulValueLen - 1];
+						(void)x;
+					}
+			} else trej++;
+			for (long k = 0; k < ntpl; k++) free(tptrs[k]);
+
+			/* the client applying a (possibly corrupt) reply to its own buffers */
+			if (!bufmode) {
+				CK_ATTRIBUTE mine[4]; unsigned char store[4][40];
+				for (i = 0; i < cnt; i++) { mine[i].type = in[i].type; mine[i].pValue = store[i]; mine[i].ulValueLen = sizeof store[i]; }
+				if (gck_rpc_template_apply(b.p, n, mine, cnt) == CKR_OK) tapply++;
+			}
+			free(b.p);
+		}
+		printf("templates: decoded %ld rejected %ld, replies applied %ld; no faults\n", tok, trej, tapply);
 	}
 	printf("random: decoded %ld rejected %ld; mutated: decoded %ld rejected %ld; no faults\n", ok, rej, mok, mrej);
 

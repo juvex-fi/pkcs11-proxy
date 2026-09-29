@@ -443,6 +443,7 @@ typedef struct {
 		CK_CCM_MESSAGE_PARAMS ccm_msg;
 		CK_SALSA20_CHACHA20_POLY1305_PARAMS chacha;
 		CK_SALSA20_CHACHA20_POLY1305_MSG_PARAMS chacha_msg;
+		CK_RSA_PKCS_OAEP_PARAMS oaep;
 	} s;
 	size_t lens[GCK_RPC_PARAM_MAX_FIELDS];
 } GckRpcParamState;
@@ -461,6 +462,24 @@ CK_RV gck_rpc_param_resp_encode(const GckRpcParamState *st,
 CK_RV gck_rpc_param_resp_apply(const GckRpcParamDesc *d, void *param,
 			       const unsigned char *blob, size_t n);
 #endif
+int gck_rpc_mechanism_flat_param_len_ok(CK_MECHANISM_TYPE mech, size_t len);
+
+/* Attributes whose value is a CK_ATTRIBUTE array (see gck-rpc-util.c) */
+typedef struct {
+	unsigned char *p;
+	size_t len, cap;
+	int err;
+} GckRpcTplBuf;
+
+int gck_rpc_attr_is_template(CK_ATTRIBUTE_TYPE type);
+int gck_rpc_template_encode(GckRpcTplBuf *b, CK_ATTRIBUTE_PTR arr, CK_ULONG n,
+			    int buffer_mode);
+CK_RV gck_rpc_template_decode(const unsigned char *blob, size_t len,
+			      int buffer_mode, void *(*alloc)(void *, size_t),
+			      void *ctx, CK_ATTRIBUTE_PTR *out, CK_ULONG *count);
+CK_RV gck_rpc_template_apply(const unsigned char *blob, size_t len,
+			     CK_ATTRIBUTE_PTR arr, CK_ULONG count);
+int gck_rpc_attribute_templates_ok(CK_ATTRIBUTE_PTR arr, CK_ULONG n);
 int gck_rpc_has_bad_sized_ulong_parameter(CK_ATTRIBUTE_PTR attr);
 int gck_rpc_has_ulong_parameter(CK_ATTRIBUTE_TYPE type);
 

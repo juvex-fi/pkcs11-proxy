@@ -95,6 +95,11 @@ typedef struct _CallState {
 	 */
 	SessionState sessions[PKCS11PROXY_MAX_SESSION_COUNT];
 	GckRpcTlsPskState *tls;
+	/* Aligned copy of a flat (pointer-free) mechanism parameter */
+	union {
+		CK_ULONG align;
+		unsigned char raw[64];
+	} mech_flat;
 #ifdef CKM_ML_DSA
 	/* Backing store for a deserialized mechanism additional-context */
 	union {
@@ -199,6 +204,12 @@ static void *call_alloc(CallState * cs, size_t length)
 
 	/* Data starts after first pointer */
 	return (void *)(data + 1);
+}
+
+/* call_alloc as a callback for the decoders in gck-rpc-util.c */
+static void *call_alloc_cb(void *ctx, size_t length)
+{
+	return call_alloc((CallState *) ctx, length);
 }
 
 static void call_reset(CallState * cs)
@@ -464,6 +475,26 @@ proto_read_attribute_buffer(CallState * cs, CK_ATTRIBUTE_PTR * result,
 		if (value == 0) {
 			attrs[i].pValue = NULL;
 			attrs[i].ulValueLen = 0;
+		} else if (gck_rpc_attr_is_template(attrs[i].type)) {
+			/* The nested attributes wanted, rebuilt locally */
+			const unsigned char *blob;
+			size_t n_blob;
+			CK_ATTRIBUTE_PTR nested;
+			CK_ULONG n_nested;
+			CK_RV rv;
+
+			if (!egg_buffer_get_byte_array(&msg->buffer, msg->parsed,
+						       &msg->parsed, &blob, &n_blob) || !blob)
+				return PARSE_ERROR;
+			rv = gck_rpc_template_decode(blob, n_blob, 1, call_alloc_cb,
+						     cs, &nested, &n_nested);
+			if (rv != CKR_OK)
+				return rv;
+			if (n_nested == 0 ||
+			    (CK_ULONG)n_nested * sizeof(CK_ATTRIBUTE) != value)
+				return CKR_ATTRIBUTE_VALUE_INVALID;
+			attrs[i].pValue = nested;
+			attrs[i].ulValueLen = value;
 		} else {
 			attrs[i].pValue = call_alloc(cs, value);
 			if (!attrs[i].pValue)
@@ -541,6 +572,27 @@ proto_read_attribute_array(CallState * cs, CK_ATTRIBUTE_PTR * result,
 			    (&msg->buffer, msg->parsed, &msg->parsed, &data,
 			     &n_data))
 				return PARSE_ERROR;
+
+			if (data != NULL && gck_rpc_attr_is_template(attrs[i].type)) {
+				/* nested attributes, rebuilt locally */
+				CK_ATTRIBUTE_PTR nested;
+				CK_ULONG n_nested;
+				CK_RV rv;
+
+				rv = gck_rpc_template_decode(data, n_data, 0, call_alloc_cb,
+							     cs, &nested, &n_nested);
+				if (rv != CKR_OK)
+					return rv;
+				if ((CK_ULONG)n_nested * sizeof(CK_ATTRIBUTE) != value)
+					return CKR_ATTRIBUTE_VALUE_INVALID;
+				attrs[i].pValue = nested;
+				attrs[i].ulValueLen = value;
+				continue;
+			}
+			if (gck_rpc_attr_is_template(attrs[i].type) && value != 0) {
+				/* a template must come with its attributes */
+				return CKR_ATTRIBUTE_VALUE_INVALID;
+			}
 
 			if (data != NULL && n_data != value) {
 				gck_rpc_warn
@@ -631,11 +683,6 @@ static CK_RV proto_read_space_string(CallState * cs, CK_UTF8CHAR_PTR * val, CK_U
 }
 
 #ifdef GCK_RPC_HAVE_V32
-static void *param_alloc(void *ctx, size_t n)
-{
-	return call_alloc((CallState *) ctx, n);
-}
-
 /*
  * Read a serialized message parameter and rebuild the CK_*_MESSAGE_PARAMS
  * structure with pointers into daemon-owned buffers. An empty parameter
@@ -687,7 +734,7 @@ static CK_RV proto_read_msg_param(CallState * cs, CK_SESSION_HANDLE session,
 	if (blob == NULL)
 		return CKR_MECHANISM_PARAM_INVALID;
 
-	rv = gck_rpc_param_decode(blob, n, phase, st, param_alloc, cs);
+	rv = gck_rpc_param_decode(blob, n, phase, st, call_alloc_cb, cs);
 	if (rv != CKR_OK)
 		return rv;
 
@@ -760,6 +807,35 @@ static CK_RV proto_read_mechanism(CallState * cs, CK_MECHANISM_PTR mech)
 	mech->pParameter = (CK_VOID_PTR) data;
 	mech->ulParameterLen = n_data;
 
+	/*
+	 * The daemon is the trust boundary: it must not rely on the client
+	 * library having filtered mechanisms or parameters. Only mechanisms
+	 * whose parameter we know how to handle safely get through; the
+	 * parameter is never passed on as the client's raw bytes unless it is
+	 * a flat structure of the exact expected size.
+	 */
+	if (!gck_rpc_mechanism_is_supported(value))
+		return CKR_MECHANISM_INVALID;
+	if (gck_rpc_mechanism_has_no_parameters(value)) {
+		mech->pParameter = NULL;
+		mech->ulParameterLen = 0;
+		return CKR_OK;
+	}
+	if (gck_rpc_mechanism_has_sane_parameters(value)) {
+		if (!gck_rpc_mechanism_flat_param_len_ok(value, n_data) ||
+		    n_data > sizeof(cs->mech_flat))
+			return CKR_MECHANISM_PARAM_INVALID;
+		if (n_data == 0) {
+			mech->pParameter = NULL;
+			mech->ulParameterLen = 0;
+		} else {
+			/* aligned, private copy */
+			memcpy(&cs->mech_flat, data, n_data);
+			mech->pParameter = &cs->mech_flat;
+		}
+		return CKR_OK;
+	}
+
 #ifdef CKM_ML_DSA
 	{
 		int kind = gck_rpc_mechanism_context_kind(value);
@@ -814,7 +890,7 @@ static CK_RV proto_read_mechanism(CallState * cs, CK_MECHANISM_PTR mech)
 				return CKR_OK;
 			}
 			rv = gck_rpc_param_decode(data, n_data, GCK_RPC_PHASE_MECH,
-						  &cs->mech_param, param_alloc, cs);
+						  &cs->mech_param, call_alloc_cb, cs);
 			if (rv != CKR_OK)
 				return rv;
 			if (cs->mech_param.desc != d)

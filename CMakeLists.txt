@@ -101,6 +101,10 @@ if (PKCS11_TESTS)
   target_include_directories(pqc-test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(pqc-test ${CMAKE_DL_LIBS})
 
+  add_executable(softhsm-test ${T}/softhsm-test.c)
+  target_include_directories(softhsm-test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(softhsm-test ${CMAKE_DL_LIBS})
+
   # Fuzzes the daemon-side AEAD parameter parser (sanitizers if available)
   add_executable(param-fuzz ${T}/param-fuzz.c gck-rpc-util.c)
   target_include_directories(param-fuzz PRIVATE ${CMAKE_SOURCE_DIR})
@@ -113,6 +117,17 @@ if (PKCS11_TESTS)
     target_link_libraries(param-fuzz -fsanitize=address,undefined)
   endif()
 
+  # The daemon's own parsers against hostile input (embeds gck-rpc-dispatch.c)
+  add_executable(daemon-input ${T}/daemon-input.c egg-buffer.c gck-rpc-message.c
+                 gck-rpc-util.c gck-rpc-tls-psk.c)
+  target_include_directories(daemon-input PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(daemon-input ${CMAKE_DL_LIBS} pthread ${OPENSSL_LIBRARIES})
+  if (PKCS11_HAVE_SANITIZERS)
+    target_compile_options(daemon-input PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=undefined -g)
+    target_link_libraries(daemon-input -fsanitize=address,undefined)
+  endif()
+  add_test(NAME daemon-input COMMAND daemon-input)
+
   add_test(NAME param-fuzz COMMAND param-fuzz 300000)
   add_test(NAME message-async
     COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
@@ -123,5 +138,9 @@ if (PKCS11_TESTS)
       COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
               $<TARGET_FILE:pkcs11-proxy> ${PKCS11_TEST_SOFTHSM_MODULE}
               $<TARGET_FILE:pqc-test> ${PKCS11_TEST_SOFTHSM_UTIL})
+    add_test(NAME templates-mechanisms-softhsm
+      COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
+              $<TARGET_FILE:pkcs11-proxy> ${PKCS11_TEST_SOFTHSM_MODULE}
+              $<TARGET_FILE:softhsm-test> ${PKCS11_TEST_SOFTHSM_UTIL})
   endif()
 endif()

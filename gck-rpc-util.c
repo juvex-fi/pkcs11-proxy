@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static void do_log(const char *pref, const char *msg, va_list va)
 {
@@ -183,6 +184,13 @@ static const GckRpcParamField ccm_fields[] = {
 	U_(CK_CCM_PARAMS, ulAADLen),
 	U_(CK_CCM_PARAMS, ulMACLen),
 };
+static const GckRpcParamField oaep_fields[] = {
+	U_(CK_RSA_PKCS_OAEP_PARAMS, hashAlg),
+	U_(CK_RSA_PKCS_OAEP_PARAMS, mgf),
+	U_(CK_RSA_PKCS_OAEP_PARAMS, source),
+	B_(CK_RSA_PKCS_OAEP_PARAMS, pSourceData, 4, 0, 0, GCK_RPC_PHASE_MECH, 0),
+	U_(CK_RSA_PKCS_OAEP_PARAMS, ulSourceDataLen),
+};
 static const GckRpcParamField chacha_fields[] = {
 	B_(CK_SALSA20_CHACHA20_POLY1305_PARAMS, pNonce, 1, 0, 0, GCK_RPC_PHASE_MECH, 0),
 	U_(CK_SALSA20_CHACHA20_POLY1305_PARAMS, ulNonceLen),
@@ -198,6 +206,7 @@ static const GckRpcParamDesc param_descs[] = {
 	{ 4, GCK_RPC_PHASE_MECH, sizeof(CK_GCM_PARAMS), NF_(gcm_fields), gcm_fields },
 	{ 5, GCK_RPC_PHASE_MECH, sizeof(CK_CCM_PARAMS), NF_(ccm_fields), ccm_fields },
 	{ 6, GCK_RPC_PHASE_MECH, sizeof(CK_SALSA20_CHACHA20_POLY1305_PARAMS), NF_(chacha_fields), chacha_fields },
+	{ 7, GCK_RPC_PHASE_MECH, sizeof(CK_RSA_PKCS_OAEP_PARAMS), NF_(oaep_fields), oaep_fields },
 };
 
 const GckRpcParamDesc *gck_rpc_param_desc_for_mechanism(CK_MECHANISM_TYPE mech)
@@ -210,6 +219,8 @@ const GckRpcParamDesc *gck_rpc_param_desc_for_mechanism(CK_MECHANISM_TYPE mech)
 	case CKM_CHACHA20_POLY1305:
 	case CKM_SALSA20_POLY1305:
 		return &param_descs[5];
+	case CKM_RSA_PKCS_OAEP:
+		return &param_descs[6];
 	default:
 		return NULL;
 	}
@@ -477,7 +488,6 @@ int gck_rpc_mechanism_has_sane_parameters(CK_MECHANISM_TYPE type)
 {
 	/* This list is incomplete */
 	switch (type) {
-	case CKM_RSA_PKCS_OAEP:
 	case CKM_RSA_PKCS_PSS:
 	/* Parameters below are flat (IV bytes or CK_ULONG fields, no
 	 * pointers), so a raw copy is safe.  Pointer-carrying params such
@@ -627,6 +637,295 @@ int gck_rpc_mechanism_has_no_parameters(CK_MECHANISM_TYPE mech)
 	default:
 		return 0;
 	};
+}
+
+/*
+ * Exact parameter length of the mechanisms whose parameter is copied
+ * verbatim; the daemon refuses anything else, because the module reads that
+ * many bytes from the buffer. A missing parameter (0) is left to the module.
+ */
+int gck_rpc_mechanism_flat_param_len_ok(CK_MECHANISM_TYPE mech, size_t len)
+{
+	size_t want, alt = 0;
+
+	if (len == 0)
+		return 1;
+	switch (mech) {
+	case CKM_RSA_PKCS_PSS:
+	case CKM_SHA1_RSA_PKCS_PSS:
+	case CKM_SHA224_RSA_PKCS_PSS:
+	case CKM_SHA256_RSA_PKCS_PSS:
+	case CKM_SHA384_RSA_PKCS_PSS:
+	case CKM_SHA512_RSA_PKCS_PSS:
+		want = sizeof(CK_RSA_PKCS_PSS_PARAMS);
+		break;
+	case CKM_AES_CBC:
+	case CKM_AES_CBC_PAD:
+		want = 16;
+		break;
+	case CKM_DES_CBC:
+	case CKM_DES_CBC_PAD:
+	case CKM_DES3_CBC:
+	case CKM_DES3_CBC_PAD:
+		want = 8;
+		break;
+	case CKM_AES_CTR:
+		want = sizeof(CK_AES_CTR_PARAMS);
+		break;
+	case CKM_AES_KEY_WRAP:
+		want = 8;
+		break;
+	case CKM_AES_KEY_WRAP_PAD:
+		want = 4;
+		alt = 8;
+		break;
+	default:
+		return 0;
+	}
+	return len == want || (alt && len == alt);
+}
+
+int gck_rpc_attr_is_template(CK_ATTRIBUTE_TYPE type)
+{
+	switch (type) {
+	case CKA_WRAP_TEMPLATE:
+	case CKA_UNWRAP_TEMPLATE:
+	case CKA_DERIVE_TEMPLATE:
+#ifdef CKA_ENCAPSULATE_TEMPLATE
+	case CKA_ENCAPSULATE_TEMPLATE:
+	case CKA_DECAPSULATE_TEMPLATE:
+#endif
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * Attributes holding a CK_ATTRIBUTE array (wrap/unwrap/derive templates)
+ * can't cross the wire as raw memory: the nested pointers mean nothing on the
+ * other side. They travel as a blob, format:
+ *
+ *   values/response:  u32 count, then per attribute: u32 type, u8 valid,
+ *                     [u32 length, u8 has_data, [data]]
+ *   buffer request:   u32 count, then per attribute: u32 type, u8 has_buffer,
+ *                     u32 capacity
+ *
+ * Templates don't nest.
+ */
+#define TPL_MAX_ATTRS	256
+#define TPL_MAX_LEN	(1u << 20)
+
+static int tpl_put(GckRpcTplBuf *b, const void *data, size_t n)
+{
+	if (b->err)
+		return 0;
+	if (n > b->cap - b->len) {
+		size_t cap = b->cap ? b->cap : 64;
+		unsigned char *p;
+
+		while (cap - b->len < n) {
+			if (cap > ((size_t)1 << 30)) { b->err = 1; return 0; }
+			cap *= 2;
+		}
+		p = realloc(b->p, cap);
+		if (!p) { b->err = 1; return 0; }
+		b->p = p;
+		b->cap = cap;
+	}
+	if (n)
+		memcpy(b->p + b->len, data, n);
+	b->len += n;
+	return 1;
+}
+
+static int tpl_u32(GckRpcTplBuf *b, uint32_t v)
+{
+	unsigned char x[4] = { v >> 24, v >> 16, v >> 8, v };
+	return tpl_put(b, x, 4);
+}
+
+static int tpl_u8(GckRpcTplBuf *b, unsigned char v)
+{
+	return tpl_put(b, &v, 1);
+}
+
+int gck_rpc_template_encode(GckRpcTplBuf *b, CK_ATTRIBUTE_PTR arr,
+			    CK_ULONG n, int buffer_mode)
+{
+	CK_ULONG i;
+
+	memset(b, 0, sizeof(*b));
+	if (n > TPL_MAX_ATTRS || (n && !arr))
+		return 0;
+	tpl_u32(b, (uint32_t)n);
+	for (i = 0; i < n; ++i) {
+		CK_ATTRIBUTE_PTR a = &arr[i];
+
+		if (gck_rpc_attr_is_template(a->type))
+			goto fail;
+		tpl_u32(b, (uint32_t)a->type);
+		if (buffer_mode) {
+			if (a->pValue && a->ulValueLen > TPL_MAX_LEN)
+				goto fail;
+			tpl_u8(b, a->pValue != NULL);
+			tpl_u32(b, a->pValue ? (uint32_t)a->ulValueLen : 0);
+		} else if ((CK_LONG)a->ulValueLen == -1) {
+			tpl_u8(b, 0);
+		} else {
+			int has_data = a->pValue != NULL && a->ulValueLen > 0;
+
+			if (a->ulValueLen > TPL_MAX_LEN)
+				goto fail;
+			tpl_u8(b, 1);
+			tpl_u32(b, (uint32_t)a->ulValueLen);
+			tpl_u8(b, has_data);
+			if (has_data)
+				tpl_put(b, a->pValue, a->ulValueLen);
+		}
+	}
+	if (!b->err)
+		return 1;
+fail:
+	free(b->p);
+	memset(b, 0, sizeof(*b));
+	return 0;
+}
+
+struct tpl_rd { const unsigned char *p; size_t len, pos; };
+
+static int rd_u32(struct tpl_rd *r, uint32_t *v)
+{
+	if (r->len - r->pos < 4)
+		return 0;
+	*v = (uint32_t)r->p[r->pos] << 24 | (uint32_t)r->p[r->pos + 1] << 16 |
+	     (uint32_t)r->p[r->pos + 2] << 8 | r->p[r->pos + 3];
+	r->pos += 4;
+	return 1;
+}
+
+static int rd_u8(struct tpl_rd *r, unsigned char *v)
+{
+	if (r->len - r->pos < 1)
+		return 0;
+	*v = r->p[r->pos++];
+	return 1;
+}
+
+CK_RV gck_rpc_template_decode(const unsigned char *blob, size_t len,
+			      int buffer_mode, void *(*alloc)(void *, size_t),
+			      void *ctx, CK_ATTRIBUTE_PTR *out, CK_ULONG *count)
+{
+	struct tpl_rd r = { blob, len, 0 };
+	CK_ATTRIBUTE_PTR arr = NULL;
+	uint32_t n, i, type, vlen;
+	unsigned char flag, has_data;
+
+	*out = NULL;
+	*count = 0;
+	if (!rd_u32(&r, &n) || n > TPL_MAX_ATTRS)
+		return CKR_ATTRIBUTE_VALUE_INVALID;
+	if (n) {
+		arr = alloc(ctx, n * sizeof(CK_ATTRIBUTE));
+		if (!arr)
+			return CKR_DEVICE_MEMORY;
+		memset(arr, 0, n * sizeof(CK_ATTRIBUTE));
+	}
+	for (i = 0; i < n; ++i) {
+		if (!rd_u32(&r, &type) || !rd_u8(&r, &flag))
+			return CKR_ATTRIBUTE_VALUE_INVALID;
+		if (gck_rpc_attr_is_template(type))
+			return CKR_ATTRIBUTE_VALUE_INVALID;
+		arr[i].type = type;
+		if (buffer_mode) {
+			if (!rd_u32(&r, &vlen) || vlen > TPL_MAX_LEN)
+				return CKR_ATTRIBUTE_VALUE_INVALID;
+			if (flag) {
+				arr[i].pValue = alloc(ctx, vlen ? vlen : 1);
+				if (!arr[i].pValue)
+					return CKR_DEVICE_MEMORY;
+				memset(arr[i].pValue, 0, vlen ? vlen : 1);
+				arr[i].ulValueLen = vlen;
+			}
+			continue;
+		}
+		if (!flag) {
+			arr[i].ulValueLen = (CK_ULONG)-1;
+			continue;
+		}
+		if (!rd_u32(&r, &vlen) || vlen > TPL_MAX_LEN ||
+		    !rd_u8(&r, &has_data))
+			return CKR_ATTRIBUTE_VALUE_INVALID;
+		if (has_data) {
+			if (vlen > r.len - r.pos)
+				return CKR_ATTRIBUTE_VALUE_INVALID;
+			arr[i].pValue = alloc(ctx, vlen);
+			if (!arr[i].pValue)
+				return CKR_DEVICE_MEMORY;
+			memcpy(arr[i].pValue, r.p + r.pos, vlen);
+			r.pos += vlen;
+		} else if (vlen) {
+			/* a value the sender claims but doesn't provide */
+			return CKR_ATTRIBUTE_VALUE_INVALID;
+		}
+		arr[i].ulValueLen = vlen;
+	}
+	if (r.pos != r.len)
+		return CKR_ATTRIBUTE_VALUE_INVALID;
+	*out = arr;
+	*count = n;
+	return CKR_OK;
+}
+
+/* Fill the caller's nested attributes from a response blob. */
+CK_RV gck_rpc_template_apply(const unsigned char *blob, size_t len,
+			     CK_ATTRIBUTE_PTR arr, CK_ULONG count)
+{
+	struct tpl_rd r = { blob, len, 0 };
+	uint32_t n, i, type, vlen;
+	unsigned char flag, has_data;
+
+	if (!rd_u32(&r, &n) || n != count)
+		return CKR_DEVICE_ERROR;
+	for (i = 0; i < n; ++i) {
+		CK_ATTRIBUTE_PTR a = &arr[i];
+
+		if (!rd_u32(&r, &type) || !rd_u8(&r, &flag) || a->type != type)
+			return CKR_DEVICE_ERROR;
+		if (!flag) {
+			a->ulValueLen = (CK_ULONG)-1;
+			continue;
+		}
+		if (!rd_u32(&r, &vlen) || !rd_u8(&r, &has_data))
+			return CKR_DEVICE_ERROR;
+		if (has_data) {
+			if (vlen > r.len - r.pos)
+				return CKR_DEVICE_ERROR;
+			if (a->pValue && vlen <= a->ulValueLen)
+				memcpy(a->pValue, r.p + r.pos, vlen);
+			else if (a->pValue)
+				return CKR_DEVICE_ERROR;
+			r.pos += vlen;
+		}
+		a->ulValueLen = vlen;
+	}
+	return r.pos == r.len ? CKR_OK : CKR_DEVICE_ERROR;
+}
+
+/* Reject sizes the nested-template code can't represent. */
+int gck_rpc_attribute_templates_ok(CK_ATTRIBUTE_PTR arr, CK_ULONG n)
+{
+	CK_ULONG i;
+
+	for (i = 0; i < n; ++i) {
+		if (!gck_rpc_attr_is_template(arr[i].type) || !arr[i].pValue)
+			continue;
+		if (arr[i].ulValueLen == (CK_ULONG)-1 ||
+		    arr[i].ulValueLen % sizeof(CK_ATTRIBUTE) != 0 ||
+		    arr[i].ulValueLen / sizeof(CK_ATTRIBUTE) > TPL_MAX_ATTRS)
+			return 0;
+	}
+	return 1;
 }
 
 int

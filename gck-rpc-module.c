@@ -787,6 +787,8 @@ proto_read_attribute_array(GckRpcMessage * msg, CK_ATTRIBUTE_PTR arr,
 	const unsigned char *attrval;
 	size_t attrlen;
 	unsigned char validity;
+	const unsigned char *tpl_blob;
+	size_t tpl_blob_len;
 	CK_RV ret;
 
 	/* Removed assertion. len == 0 is valid for some ret's,
@@ -828,6 +830,8 @@ proto_read_attribute_array(GckRpcMessage * msg, CK_ATTRIBUTE_PTR arr,
 		/* Attribute validity */
 		egg_buffer_get_byte(&msg->buffer, msg->parsed,
 				    &msg->parsed, &validity);
+		tpl_blob = NULL;
+		tpl_blob_len = 0;
 
 		/* And the data itself */
 		if (validity) {
@@ -837,7 +841,12 @@ proto_read_attribute_array(GckRpcMessage * msg, CK_ATTRIBUTE_PTR arr,
 							 msg->parsed,
 							 &msg->parsed, &attrval,
 							 &attrlen)) {
-				if (attrval && value != attrlen) {
+				if (attrval && gck_rpc_attr_is_template(type)) {
+					/* the data is the nested attributes, the length
+					 * is that of the CK_ATTRIBUTE array */
+					tpl_blob = attrval;
+					tpl_blob_len = attrlen;
+				} else if (attrval && value != attrlen) {
 					warning(("attribute length does not match attribute data"));
 					return PARSE_ERROR;
 				}
@@ -869,6 +878,16 @@ proto_read_attribute_array(GckRpcMessage * msg, CK_ATTRIBUTE_PTR arr,
 				} else if (attr->ulValueLen < attrlen) {
 					attr->ulValueLen = attrlen;
 					ret = CKR_BUFFER_TOO_SMALL;
+
+					/* A template: fill in the caller's nested attributes */
+				} else if (tpl_blob) {
+					if (gck_rpc_template_apply(tpl_blob, tpl_blob_len,
+								   attr->pValue,
+								   attr->ulValueLen / sizeof(CK_ATTRIBUTE)) != CKR_OK) {
+						warning(("invalid nested attributes in reply"));
+						return PARSE_ERROR;
+					}
+					attr->ulValueLen = attrlen;
 
 					/* Wants attribute data, value is null */
 				} else if (attrval == NULL) {
@@ -1122,9 +1141,14 @@ static CK_RV proto_write_mechanism(GckRpcMessage * msg, CK_MECHANISM_PTR mech)
 
 	if (gck_rpc_mechanism_has_no_parameters(mech->mechanism))
 		egg_buffer_add_byte_array(&msg->buffer, NULL, 0);
-	else if (gck_rpc_mechanism_has_sane_parameters(mech->mechanism))
+	else if (gck_rpc_mechanism_has_sane_parameters(mech->mechanism)) {
+		if ((mech->pParameter == NULL && mech->ulParameterLen != 0) ||
+		    !gck_rpc_mechanism_flat_param_len_ok(mech->mechanism,
+							 mech->ulParameterLen))
+			return CKR_MECHANISM_PARAM_INVALID;
 		egg_buffer_add_byte_array(&msg->buffer, mech->pParameter,
 					  mech->ulParameterLen);
+	}
 #ifdef CKM_ML_DSA
 	else if (gck_rpc_mechanism_context_kind(mech->mechanism))
 		return proto_write_context_parameter(msg, mech);
@@ -1297,12 +1321,16 @@ proto_read_sesssion_info(GckRpcMessage * msg, CK_SESSION_INFO_PTR info)
 #define IN_ATTRIBUTE_BUFFER(arr, num) \
 	if (num != 0 && arr == NULL) \
 		{ _ret = CKR_ARGUMENTS_BAD; goto _cleanup; } \
+	if (!gck_rpc_attribute_templates_ok ((arr), (num))) \
+		{ _ret = CKR_ATTRIBUTE_VALUE_INVALID; goto _cleanup; } \
 	if (!gck_rpc_message_write_attribute_buffer (_cs->req, (arr), (num))) \
 		{ _ret = CKR_HOST_MEMORY; goto _cleanup; }
 
 #define IN_ATTRIBUTE_ARRAY(arr, num) \
 	if (num != 0 && arr == NULL) \
 		{ _ret = CKR_ARGUMENTS_BAD; goto _cleanup; } \
+	if (!gck_rpc_attribute_templates_ok ((arr), (num))) \
+		{ _ret = CKR_ATTRIBUTE_VALUE_INVALID; goto _cleanup; } \
 	if (!gck_rpc_message_write_attribute_array (_cs->req, (arr), (num))) \
 		{ _ret = CKR_HOST_MEMORY; goto _cleanup; }
 

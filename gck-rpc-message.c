@@ -26,6 +26,7 @@
 #include "gck-rpc-layer.h"
 #include "gck-rpc-private.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef G_DISABLE_ASSERT
@@ -243,6 +244,17 @@ gck_rpc_message_write_attribute_buffer(GckRpcMessage * msg,
 		/* And the attribute buffer length */
 		egg_buffer_add_uint32(&msg->buffer,
 				      attr->pValue ? attr->ulValueLen : 0);
+
+		/* A template buffer also says which nested attributes it wants */
+		if (attr->pValue && gck_rpc_attr_is_template(attr->type)) {
+			GckRpcTplBuf tb;
+
+			if (!gck_rpc_template_encode(&tb, attr->pValue,
+						     attr->ulValueLen / sizeof(CK_ATTRIBUTE), 1))
+				return 0;
+			egg_buffer_add_byte_array(&msg->buffer, tb.p, tb.len);
+			free(tb.p);
+		}
 	}
 
 	return !egg_buffer_has_error(&msg->buffer);
@@ -278,7 +290,17 @@ gck_rpc_message_write_attribute_array(GckRpcMessage * msg,
 		/* The attribute length and value */
 		if (validity) {
 			egg_buffer_add_uint32(&msg->buffer, attr->ulValueLen);
-			if (gck_rpc_has_bad_sized_ulong_parameter(attr)) {
+			if (attr->pValue && gck_rpc_attr_is_template(attr->type)) {
+				/* nested attributes travel as a blob, not raw memory */
+				GckRpcTplBuf tb;
+
+				if (attr->ulValueLen % sizeof(CK_ATTRIBUTE) != 0 ||
+				    !gck_rpc_template_encode(&tb, attr->pValue,
+							     attr->ulValueLen / sizeof(CK_ATTRIBUTE), 0))
+					return 0;
+				egg_buffer_add_byte_array(&msg->buffer, tb.p, tb.len);
+				free(tb.p);
+			} else if (gck_rpc_has_bad_sized_ulong_parameter(attr)) {
 				uint64_t val = *(CK_ULONG *)attr->pValue;
 
 				egg_buffer_add_byte_array (&msg->buffer, (unsigned char *)&val, sizeof (val));
