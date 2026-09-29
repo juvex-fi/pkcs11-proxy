@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="ubuntu:24.04"
+IMAGE="ubuntu:26.04"
 BUILD_DIR="build/linux"
 
 echo "==> Building in Docker (${IMAGE})"
