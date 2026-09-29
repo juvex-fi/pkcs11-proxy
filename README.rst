@@ -15,6 +15,31 @@ suite.
 
 An ubuntu PPA that tracks this version is ppa:leifj
 
+PKCS#11 v3.2
+============
+
+Built against the OASIS v3.2 headers by default (``-DPKCS11_V32=ON``). All
+104 functions are proxied, ``C_GetInterface``/``C_GetInterfaceList`` are
+exported, and the post-quantum mechanisms (ML-KEM, ML-DSA, SLH-DSA, HSS, XMSS)
+work, including the optional signing context. AES-GCM, AES-CCM and
+ChaCha20-Poly1305 are supported both as single-part mechanisms and in the
+message-based API; their parameter structures are serialized field by field,
+so no client pointer reaches the module in the daemon.
+
+Tests
+=====
+
+::
+
+  cmake -B build -DPKCS11_TESTS=ON && cmake --build build && (cd build && ctest)
+
+This runs a fuzzer for the daemon's parameter parser and an end-to-end test of
+the message-based, single-part AEAD and async functions against a mock module.
+To also test ML-KEM/ML-DSA through the proxy, pass a SoftHSM built with them::
+
+  -DPKCS11_TEST_SOFTHSM_MODULE=/path/to/libsofthsm2.so \
+  -DPKCS11_TEST_SOFTHSM_UTIL=/path/to/softhsm2-util
+
 Credits
 =======
 

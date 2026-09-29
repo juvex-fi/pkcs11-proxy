@@ -73,3 +73,55 @@ add_custom_command(
    OUTPUT syscall-names.h 
    COMMAND ${CMAKE_SOURCE_DIR}/mksyscalls.sh
    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# Tests: cmake -DPKCS11_TESTS=ON, then "ctest". The PQC test additionally needs
+# a SoftHSM built with ML-DSA/ML-KEM:
+#   -DPKCS11_TEST_SOFTHSM_MODULE=/path/libsofthsm2.so
+#   -DPKCS11_TEST_SOFTHSM_UTIL=/path/softhsm2-util
+option(PKCS11_TESTS "Build the tests (needs PKCS11_V32)" OFF)
+set(PKCS11_TEST_SOFTHSM_MODULE "" CACHE FILEPATH "SoftHSM module for the PQC test")
+set(PKCS11_TEST_SOFTHSM_UTIL "" CACHE FILEPATH "softhsm2-util for the PQC test")
+if (PKCS11_TESTS)
+  if (NOT PKCS11_V32 OR WIN32)
+    message(FATAL_ERROR "PKCS11_TESTS needs PKCS11_V32 and a POSIX system")
+  endif()
+  enable_testing()
+  set(T ${CMAKE_SOURCE_DIR}/tests)
+
+  # A PKCS#11 3.2 module for the daemon to load
+  add_library(p11-mock-module MODULE ${T}/mock-module.c)
+  target_include_directories(p11-mock-module PRIVATE ${CMAKE_SOURCE_DIR})
+  set_target_properties(p11-mock-module PROPERTIES PREFIX "")
+
+  add_executable(message-test ${T}/message-test.c)
+  target_include_directories(message-test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(message-test ${CMAKE_DL_LIBS})
+
+  add_executable(pqc-test ${T}/pqc-test.c)
+  target_include_directories(pqc-test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pqc-test ${CMAKE_DL_LIBS})
+
+  # Fuzzes the daemon-side AEAD parameter parser (sanitizers if available)
+  add_executable(param-fuzz ${T}/param-fuzz.c gck-rpc-util.c)
+  target_include_directories(param-fuzz PRIVATE ${CMAKE_SOURCE_DIR})
+  include(CheckCCompilerFlag)
+  set(CMAKE_REQUIRED_FLAGS "-fsanitize=address,undefined")
+  check_c_compiler_flag("-fsanitize=address,undefined" PKCS11_HAVE_SANITIZERS)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if (PKCS11_HAVE_SANITIZERS)
+    target_compile_options(param-fuzz PRIVATE -fsanitize=address,undefined -fno-sanitize-recover=undefined -g)
+    target_link_libraries(param-fuzz -fsanitize=address,undefined)
+  endif()
+
+  add_test(NAME param-fuzz COMMAND param-fuzz 300000)
+  add_test(NAME message-async
+    COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
+            $<TARGET_FILE:pkcs11-proxy> $<TARGET_FILE:p11-mock-module>
+            $<TARGET_FILE:message-test>)
+  if (PKCS11_TEST_SOFTHSM_MODULE AND PKCS11_TEST_SOFTHSM_UTIL)
+    add_test(NAME pqc-softhsm
+      COMMAND ${T}/run-with-daemon.sh $<TARGET_FILE:pkcs11-daemon>
+              $<TARGET_FILE:pkcs11-proxy> ${PKCS11_TEST_SOFTHSM_MODULE}
+              $<TARGET_FILE:pqc-test> ${PKCS11_TEST_SOFTHSM_UTIL})
+  endif()
+endif()
