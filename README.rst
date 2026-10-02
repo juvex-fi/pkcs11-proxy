@@ -1,4 +1,10 @@
 
+.. note::
+
+   **A newer and better alternative is available:**
+   `p11-proxy-rs <https://github.com/juvex-fi/p11-proxy-rs>`_. New users
+   are encouraged to use it instead of this project.
+
 PKCS11 Proxy
 ============
 
